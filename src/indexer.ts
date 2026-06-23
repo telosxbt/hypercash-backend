@@ -24,21 +24,29 @@ export function getChainHead(): number {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+// Only TRUE size-cap errors should trigger a window split. The generic
+// "invalid block range" some nodes return under load is NOT a size problem —
+// splitting a sub-cap window just multiplies failing calls. Treat it as transient.
 const isRangeError = (msg: string) =>
-  /block range|exceeds max block range|up to a \d+ block|query returned more than|response size/i.test(msg)
-const isRateLimited = (msg: string) => /rate limit|429|too many|timeout|ETIMEDOUT|ECONN/i.test(msg)
+  /exceeds max block range|up to a \d+ block range|limited to a [\d,]+ range|query returned more than|response size|max is \d+ blocks/i.test(
+    msg,
+  )
+const isTransient = (msg: string) =>
+  /rate limit|429|too many|timeout|ETIMEDOUT|ECONN|invalid block range|bad response|noNetwork|could not detect network|503|502|temporarily/i.test(
+    msg,
+  )
 
-// getLogs with backoff on transient/rate-limit errors. Range-too-large errors are
-// rethrown so the caller can split the window.
-async function fetchLogs(filter: ethers.providers.Filter, tries = 6): Promise<ethers.providers.Log[]> {
+// getLogs with backoff on transient errors. Range-too-large errors are rethrown
+// so the caller can split the window.
+async function fetchLogs(filter: ethers.providers.Filter, tries = 8): Promise<ethers.providers.Log[]> {
   for (let i = 0; ; i++) {
     try {
       return await provider.getLogs(filter)
     } catch (e: any) {
       const msg = String(e?.error?.message || e?.body || e?.message || e)
       if (isRangeError(msg)) throw e // caller will split
-      if (i >= tries - 1 || (!isRateLimited(msg) && i >= 2)) throw e
-      await sleep(Math.min(500 * 2 ** i, 8000))
+      if (i >= tries - 1 || (!isTransient(msg) && i >= 2)) throw e
+      await sleep(Math.min(400 * 2 ** i, 8000))
     }
   }
 }
