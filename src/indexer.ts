@@ -36,32 +36,20 @@ const isTransient = (msg: string) =>
     msg,
   )
 
-// getLogs with backoff on transient errors. Range-too-large errors are rethrown
-// so the caller can split the window. QuikNode's HyperEVM testnet load-balances
-// across nodes with inconsistent archive depth, so a deep range intermittently
-// returns "invalid block range" depending on which node serves it — retry hard
-// with jitter until a node that has the data answers.
-async function fetchLogs(filter: ethers.providers.Filter, tries = 14): Promise<ethers.providers.Log[]> {
-  for (let i = 0; ; i++) {
-    try {
-      return await provider.getLogs(filter)
-    } catch (e: any) {
-      const msg = String(e?.error?.message || e?.body || e?.message || e)
-      if (isRangeError(msg)) throw e // caller will split
-      if (i >= tries - 1 || (!isTransient(msg) && i >= 2)) throw e
-      const backoff = Math.min(300 * 2 ** Math.min(i, 5), 6000)
-      await sleep(backoff + Math.floor(Math.random() * 400)) // jitter spreads across nodes
-    }
-  }
-}
+// Below this span we stop splitting and just retry — QuikNode's HyperEVM testnet
+// load-balances across nodes with inconsistent archive depth, so deep ranges
+// fail erratically by node, not cleanly by size.
+const MIN_SPLIT_SPAN = 50
+const isSplittable = (msg: string) => isRangeError(msg) || /invalid block range/i.test(msg)
 
-// Scan one window; if the provider rejects the block range (caps vary: 1000 on
-// QuikNode, as little as 10 on Alchemy free tier), recursively halve it so the
-// indexer is correct regardless of the RPC's limit.
-async function scanWindow(pool: PoolConfig, fromBlock: number, toBlock: number): Promise<void> {
+// Scan one window. Strategy: a too-large / flaky-large range is halved (handles
+// both true size caps — 1000 QuikNode, 10 Alchemy — and big deep ranges that a
+// node rejects); once small, we retry with jittered backoff until a node that
+// actually has the data answers.
+async function scanWindow(pool: PoolConfig, fromBlock: number, toBlock: number, attempt = 0): Promise<void> {
   let logs: ethers.providers.Log[]
   try {
-    logs = await fetchLogs({
+    logs = await provider.getLogs({
       address: pool.address,
       fromBlock,
       toBlock,
@@ -69,11 +57,16 @@ async function scanWindow(pool: PoolConfig, fromBlock: number, toBlock: number):
     })
   } catch (e: any) {
     const msg = String(e?.error?.message || e?.body || e?.message || e)
-    if (isRangeError(msg) && toBlock > fromBlock) {
+    const span = toBlock - fromBlock + 1
+    if (isSplittable(msg) && span > MIN_SPLIT_SPAN && toBlock > fromBlock) {
       const mid = Math.floor((fromBlock + toBlock) / 2)
       await scanWindow(pool, fromBlock, mid)
       await scanWindow(pool, mid + 1, toBlock)
       return
+    }
+    if ((isSplittable(msg) || isTransient(msg)) && attempt < 20) {
+      await sleep(Math.min(300 * 2 ** Math.min(attempt, 4), 4000) + Math.floor(Math.random() * 500))
+      return scanWindow(pool, fromBlock, toBlock, attempt + 1)
     }
     throw e
   }
