@@ -37,8 +37,11 @@ const isTransient = (msg: string) =>
   )
 
 // getLogs with backoff on transient errors. Range-too-large errors are rethrown
-// so the caller can split the window.
-async function fetchLogs(filter: ethers.providers.Filter, tries = 8): Promise<ethers.providers.Log[]> {
+// so the caller can split the window. QuikNode's HyperEVM testnet load-balances
+// across nodes with inconsistent archive depth, so a deep range intermittently
+// returns "invalid block range" depending on which node serves it — retry hard
+// with jitter until a node that has the data answers.
+async function fetchLogs(filter: ethers.providers.Filter, tries = 14): Promise<ethers.providers.Log[]> {
   for (let i = 0; ; i++) {
     try {
       return await provider.getLogs(filter)
@@ -46,7 +49,8 @@ async function fetchLogs(filter: ethers.providers.Filter, tries = 8): Promise<et
       const msg = String(e?.error?.message || e?.body || e?.message || e)
       if (isRangeError(msg)) throw e // caller will split
       if (i >= tries - 1 || (!isTransient(msg) && i >= 2)) throw e
-      await sleep(Math.min(400 * 2 ** i, 8000))
+      const backoff = Math.min(300 * 2 ** Math.min(i, 5), 6000)
+      await sleep(backoff + Math.floor(Math.random() * 400)) // jitter spreads across nodes
     }
   }
 }
@@ -113,8 +117,17 @@ async function scanRange(pool: PoolConfig, from: number, to: number): Promise<vo
   }
   for (let i = 0; i < windows.length; i += config.backfillConcurrency) {
     const batch = windows.slice(i, i + config.backfillConcurrency)
-    await Promise.all(batch.map(([a, b]) => scanWindow(pool, a, b)))
-    await setLastBlock(pool.address, batch[batch.length - 1][1])
+    const results = await Promise.allSettled(batch.map(([a, b]) => scanWindow(pool, a, b)))
+    const firstFail = results.findIndex((r) => r.status === 'rejected')
+    if (firstFail === -1) {
+      await setLastBlock(pool.address, batch[batch.length - 1][1])
+      continue
+    }
+    // Advance only through the contiguous success prefix, then stop so the next
+    // poll resumes at the failed window (bounded re-scan, never an infinite loop).
+    if (firstFail > 0) await setLastBlock(pool.address, batch[firstFail - 1][1])
+    const reason = (results[firstFail] as PromiseRejectedResult).reason
+    throw new Error(`window ${batch[firstFail][0]}-${batch[firstFail][1]} failed: ${String(reason).slice(0, 120)}`)
   }
 }
 
