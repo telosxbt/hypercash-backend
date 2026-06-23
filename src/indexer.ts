@@ -131,7 +131,9 @@ export async function indexPoolOnce(pool: PoolConfig): Promise<void> {
   if (safeHead < pool.deployBlock) return
 
   const last = await getLastBlock(pool.address)
-  const cursor = last ?? pool.deployBlock - 1
+  // deployBlock is a floor: raising it (e.g. past dead archive ranges, when there
+  // is no earlier history to index) lets the cursor jump forward past stale state.
+  const cursor = Math.max(last ?? pool.deployBlock - 1, pool.deployBlock - 1)
   // Rewind a touch for reorg safety; never before deployBlock.
   const from = Math.max(pool.deployBlock, cursor - REORG_BUFFER + 1)
   if (from > safeHead) return
