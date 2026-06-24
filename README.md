@@ -62,26 +62,42 @@ bun run src/index.ts   # migrates DB, starts indexer loops, serves API
 Dockerfile + `railway.json` (healthcheck `/health`). Attach a Postgres plugin
 (`DATABASE_URL` is injected); set `RPC_URL` and `POOLS`.
 
-## Relayer (`/relay/*`) — optional, same service
+## Relayer (`/relay/*`) — v1, optional, same service
 
-A gasless verify+submit relayer is mounted on this service **only when
+Gasless verify+submit relayer mounted on this service **only when
 `RELAYER_PRIVATE_KEY` (+ `TRADER_ADDRESS`, `USDC_POOL_ADDRESS`,
-`BTC_POOL_ADDRESS`, `ADAPTER_ADDRESS`) are set**. Otherwise the indexer/API runs
-unchanged. The frontend builds every proof; the relayer only checks the tx pays
-it a fee (≥ `MIN_FEE_USDC`/`MIN_FEE_BTC`), `callStatic`-simulates to reject
-reverts without burning gas, then signs+submits (serialized nonce, fixed gas for
-CoreWriter txs).
+`HYPE_POOL_ADDRESS`) are set**. Otherwise the indexer/API runs unchanged. The
+frontend builds every proof; the relayer checks the tx pays it a fee
+(≥ `MIN_FEE_*`), `callStatic`-simulates, then signs+submits (serialized nonce).
 
-- `GET /relay/info` → `{ relayer, fees: { "<poolAddrLower>": "<feeBaseUnits>" } }`
-- `POST /relay/initiate` `{ proof, extData, p, side?:'buy'|'sell' }` → `{ tradeId, cloid, txHash }` (also accepts `params` for `p`)
-- `POST /relay/settle` `{ tradeId, proof, ext, side }` → `{ txHash }` (needs `orderStatus.filledSize >= size`, else `409`)
-- `POST /relay/cancel` `{ tradeId, proof, ext, side }` → `{ txHash }` (needs `now > deadline` & not filled)
-- `POST /relay/withdraw` `{ proof, extData, pool:'usdc'|'btc' }` → `{ txHash }`
+**v1 trade flow (no shielded settle):**
+1. `POST /relay/trade` `{ proof, extData, params }` → TX1 `trade()`. The USDC fee
+   is charged here and must cover the gas of **both** `trade()` and the later
+   `deliver()` — size `MIN_FEE_USDC` accordingly. Returns `{ txHash, tradeId }`;
+   the trade (account, assetCoreToken, size, recipient) is persisted.
+2. **Delivery worker** polls every `RELAY_POLL_MS` (~8s): for each open trade,
+   reads `core.spotBalance(account, assetCoreToken)` (`core = trader.core()`);
+   once `>= size` it `callStatic`s then sends **TX2 `deliver(tradeId)`** (gas paid
+   by the relayer). Never calls `deliver` before the fill (async on HyperCore).
+   `deliver()` is permissionless + idempotent (DB status + status guard).
+
+Other endpoints:
+- `POST /relay/transact` `{ proof, extData, pool:'usdc'|'hype' }` → shielded
+  deposit/withdraw (`pool.transact`), fee in-token → `{ txHash }`
+- `GET /relay/info` → `{ relayer, trader, fees: { "<poolAddrLower>": "<feeBaseUnits>" } }`
 - `GET /relay/health`
 
-**Contract deltas (built to spec; current `feat/hypertrade` is behind):** sell
-side (`initiateSell`/`settleSell`/`cancelSell`/`sells`/`SellInitiated`) doesn't
-exist yet; `settle/cancel` currently take only `tradeId` (spec passes
-`(tradeId, proof, ext)` + BTC fee); `adapter.orderStatus` is a stub `(0,0)`.
-Buy + withdraw map to the current contract. Keep `src/relay/abis.ts` in sync with
-the deployed contract.
+`recipient` + venue are frozen on-chain at `trade()` — the relayer can't
+redirect; its only guard is `feeRecipient == relayer` + sufficient fee.
+
+### Contract surface required (v1)
+
+Built against a v1 HyperTrader that must expose (keep `src/relay/abis.ts` in sync):
+- `trade(proof, extData, params) returns (uint256)` emitting
+  `Traded(uint256 indexed tradeId, address account, uint64 assetCoreToken, uint64 size, address recipient, uint128 cloid)`
+- `deliver(uint256 tradeId)` (permissionless; reverts if not filled / already delivered)
+- `core() view returns (address)` → a gateway with `spotBalance(address, uint64) view returns (uint64)`
+- the pools' `transact(proof, extData)`
+
+The two-step shielded flow (initiate/settle/cancel/sell) is preserved on the
+`v2` branch.

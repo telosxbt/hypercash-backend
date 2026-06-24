@@ -1,13 +1,19 @@
-// Optional relayer, mounted onto the backend's Hono app. Enabled only when
-// RELAYER_PRIVATE_KEY (+ contract addresses) are set, so the indexer/API runs
-// fine without it. The relayer NEVER builds a proof — the frontend sends
-// pre-built {proof, extData, params}; the relayer checks the fee pays it,
-// callStatic-simulates to reject reverts without burning gas, then signs+submits
-// (paying the gas) with serialized nonce management.
+// v1 relayer, mounted on the backend's Hono app. Enabled only when
+// RELAYER_PRIVATE_KEY (+ TRADER/USDC_POOL/HYPE_POOL addresses) are set.
+//
+// Flow (v1, no shielded settle):
+//   /relay/trade  -> TX1 trade()  (charges the USDC fee upfront, opens a trade)
+//   delivery worker polls the fill -> TX2 deliver(tradeId) once spotBalance >= size
+//   /relay/transact -> pool.transact() (shielded deposit/withdraw, fee in-token)
+//
+// The relayer never builds a proof. It checks the fee pays it (sized to cover
+// BOTH trade() and deliver() gas), callStatic-simulates, then signs+submits.
+// recipient + venue are frozen on-chain at trade(): the relayer can't redirect.
 import type { Hono } from 'hono'
 import { ethers, BigNumber } from 'ethers'
-import { TRADER_ABI, ADAPTER_ABI, POOL_ABI, STATUS } from './abis'
+import { TRADER_ABI, CORE_ABI, POOL_ABI } from './abis'
 import { checkFee } from './validate'
+import { initRelayStore, recordTrade, openTrades, markDelivered } from './store'
 
 interface RelayConfig {
   privateKey: string
@@ -15,13 +21,13 @@ interface RelayConfig {
   chainId: number
   trader: string
   usdcPool: string
-  btcPool: string
-  adapter: string
+  hypePool: string
+  coreGateway?: string
   minFeeUsdc: BigNumber
-  minFeeBtc: BigNumber
-  gasInitiate: number
-  gasSettle: number
-  gasCancel: number
+  minFeeHype: BigNumber
+  gasTrade: number
+  gasDeliver: number
+  pollMs: number
 }
 
 function envInt(name: string, fallback: number): number {
@@ -31,10 +37,9 @@ function envInt(name: string, fallback: number): number {
 
 function loadRelayConfig(): RelayConfig | null {
   const privateKey = process.env.RELAYER_PRIVATE_KEY
-  if (!privateKey) return null
   const rpcUrl = process.env.RPC_URL
-  if (!rpcUrl) return null
-  const need = ['TRADER_ADDRESS', 'USDC_POOL_ADDRESS', 'BTC_POOL_ADDRESS', 'ADAPTER_ADDRESS'] as const
+  if (!privateKey || !rpcUrl) return null
+  const need = ['TRADER_ADDRESS', 'USDC_POOL_ADDRESS', 'HYPE_POOL_ADDRESS'] as const
   for (const n of need) {
     if (!process.env[n]) {
       console.warn(`[relay] ${n} not set — relayer disabled`)
@@ -47,13 +52,13 @@ function loadRelayConfig(): RelayConfig | null {
     chainId: envInt('CHAIN_ID', 998),
     trader: process.env.TRADER_ADDRESS!.toLowerCase(),
     usdcPool: process.env.USDC_POOL_ADDRESS!.toLowerCase(),
-    btcPool: process.env.BTC_POOL_ADDRESS!.toLowerCase(),
-    adapter: process.env.ADAPTER_ADDRESS!.toLowerCase(),
+    hypePool: process.env.HYPE_POOL_ADDRESS!.toLowerCase(),
+    coreGateway: process.env.CORE_GATEWAY?.toLowerCase(),
     minFeeUsdc: BigNumber.from(process.env.MIN_FEE_USDC || '0'),
-    minFeeBtc: BigNumber.from(process.env.MIN_FEE_BTC || '0'),
-    gasInitiate: envInt('GAS_INITIATE', 2_500_000),
-    gasSettle: envInt('GAS_SETTLE', 2_500_000),
-    gasCancel: envInt('GAS_CANCEL', 1_500_000),
+    minFeeHype: BigNumber.from(process.env.MIN_FEE_HYPE || '0'),
+    gasTrade: envInt('GAS_TRADE', 2_500_000),
+    gasDeliver: envInt('GAS_DELIVER', 2_000_000),
+    pollMs: envInt('RELAY_POLL_MS', 8000),
   }
 }
 
@@ -62,12 +67,12 @@ function extractRevert(e: any): string {
     e?.error?.error?.message || e?.error?.message || e?.reason || e?.body || e?.message || e,
   ).slice(0, 300)
 }
+const alreadyDone = (msg: string) => /not open|already|delivered|settled|cancel/i.test(msg)
 
-/** Mount /relay/* on the given app. Returns true if the relayer is enabled. */
 export function mountRelay(app: Hono): boolean {
   const cfg = loadRelayConfig()
   if (!cfg) {
-    console.log('Relayer disabled (set RELAYER_PRIVATE_KEY + TRADER/USDC_POOL/BTC_POOL/ADAPTER_ADDRESS to enable).')
+    console.log('Relayer disabled (set RELAYER_PRIVATE_KEY + TRADER/USDC_POOL/HYPE_POOL_ADDRESS to enable).')
     return false
   }
 
@@ -78,11 +83,11 @@ export function mountRelay(app: Hono): boolean {
   const wallet = new ethers.Wallet(cfg.privateKey, provider)
   const relayer = wallet.address.toLowerCase()
   const trader = new ethers.Contract(cfg.trader, TRADER_ABI, wallet)
-  const adapter = new ethers.Contract(cfg.adapter, ADAPTER_ABI, provider)
-  const pools = {
+  const pools: Record<string, ethers.Contract> = {
     usdc: new ethers.Contract(cfg.usdcPool, POOL_ABI, wallet),
-    btc: new ethers.Contract(cfg.btcPool, POOL_ABI, wallet),
+    hype: new ethers.Contract(cfg.hypePool, POOL_ABI, wallet),
   }
+  const minFeeFor = (pool: string) => (pool === 'hype' ? cfg.minFeeHype : cfg.minFeeUsdc)
 
   // serialized nonce management
   let lock: Promise<void> = Promise.resolve()
@@ -115,115 +120,70 @@ export function mountRelay(app: Hono): boolean {
   }
   const simulate = (c: ethers.Contract, method: string, args: any[]) =>
     c.callStatic[method](...args, { from: relayer })
-  const isSell = (s: unknown) => s === 'sell'
-  function parseInitEvent(receipt: any, name: string) {
-    for (const log of receipt.logs ?? []) {
-      try {
-        const p = trader.interface.parseLog(log)
-        if (p.name === name) return { tradeId: p.args.tradeId.toString(), cloid: p.args.cloid.toString() }
-      } catch {
-        /* skip */
-      }
-    }
-    return { tradeId: undefined, cloid: undefined }
-  }
 
+  // ---------------------------------------------------------------- routes
   app.get('/relay/health', (c) => c.json({ ok: true, relayer, trader: cfg.trader }))
 
-  // Frontend-facing info: relayer address + min fee per pool (base units, keyed
-  // by lowercased pool address) so the UI can build a fee the relayer accepts.
   app.get('/relay/info', (c) =>
     c.json({
       relayer,
-      fees: {
-        [cfg.usdcPool]: cfg.minFeeUsdc.toString(),
-        [cfg.btcPool]: cfg.minFeeBtc.toString(),
-      },
+      trader: cfg.trader,
+      fees: { [cfg.usdcPool]: cfg.minFeeUsdc.toString(), [cfg.hypePool]: cfg.minFeeHype.toString() },
     }),
   )
 
-  app.post('/relay/initiate', async (c) => {
+  // TX1 — open a trade. Fee (USDC) is charged here and must cover trade()+deliver() gas.
+  app.post('/relay/trade', async (c) => {
     try {
       const body = await c.req.json()
-      const { proof, extData, side } = body
-      const params = body.params ?? body.p // frontend sends `p`
-      if (!proof || !extData || !params) return c.json({ error: 'proof/extData/p required' }, 400)
-      const fee = checkFee(extData, relayer, isSell(side) ? cfg.minFeeBtc : cfg.minFeeUsdc)
+      const { proof, extData } = body
+      const params = body.params ?? body.p ?? body.order
+      if (!proof || !extData || !params) return c.json({ error: 'proof/extData/params required' }, 400)
+      const fee = checkFee(extData, relayer, cfg.minFeeUsdc)
       if (!fee.ok) return c.json({ error: fee.error }, 400)
-      const method = isSell(side) ? 'initiateSell' : 'initiateTrade'
       try {
-        await simulate(trader, method, [proof, extData, params])
+        await simulate(trader, 'trade', [proof, extData, params])
       } catch (e) {
         return c.json({ error: 'simulation_reverted', reason: extractRevert(e) }, 400)
       }
-      const tx = await send(trader, method, [proof, extData, params], cfg.gasInitiate)
+      const tx = await send(trader, 'trade', [proof, extData, params], cfg.gasTrade)
       const receipt = await tx.wait(1)
-      const { tradeId, cloid } = parseInitEvent(receipt, isSell(side) ? 'SellInitiated' : 'TradeInitiated')
-      return c.json({ tradeId, cloid, txHash: tx.hash })
-    } catch (e) {
-      return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
-    }
-  })
-
-  app.post('/relay/settle', async (c) => {
-    try {
-      const { tradeId, proof, ext, side } = await c.req.json()
-      if (tradeId === undefined || !proof || !ext) return c.json({ error: 'tradeId/proof/ext required' }, 400)
-      const t = await trader[isSell(side) ? 'sells' : 'trades'](BigNumber.from(tradeId))
-      if (Number(t.status) !== STATUS.Open) return c.json({ error: 'trade_not_open', status: Number(t.status) }, 409)
-      const [filledSize] = await adapter.orderStatus(t.cloid)
-      if (BigNumber.from(filledSize).lt(t.size))
-        return c.json({ error: 'not_filled_yet', filledSize: filledSize.toString(), size: t.size.toString() }, 409)
-      const fee = checkFee(ext, relayer, cfg.minFeeBtc)
-      if (!fee.ok) return c.json({ error: fee.error }, 400)
-      const method = isSell(side) ? 'settleSell' : 'settleTrade'
-      try {
-        await simulate(trader, method, [BigNumber.from(tradeId), proof, ext])
-      } catch (e) {
-        return c.json({ error: 'simulation_reverted', reason: extractRevert(e) }, 400)
+      let rec: any
+      for (const log of receipt.logs ?? []) {
+        try {
+          const p = trader.interface.parseLog(log)
+          if (p.name === 'Traded') rec = p.args
+        } catch {
+          /* not ours */
+        }
       }
-      const tx = await send(trader, method, [BigNumber.from(tradeId), proof, ext], cfg.gasSettle)
-      await tx.wait(1)
-      return c.json({ txHash: tx.hash })
-    } catch (e) {
-      return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
-    }
-  })
-
-  app.post('/relay/cancel', async (c) => {
-    try {
-      const { tradeId, proof, ext, side } = await c.req.json()
-      if (tradeId === undefined || !proof || !ext) return c.json({ error: 'tradeId/proof/ext required' }, 400)
-      const t = await trader[isSell(side) ? 'sells' : 'trades'](BigNumber.from(tradeId))
-      if (Number(t.status) !== STATUS.Open) return c.json({ error: 'trade_not_open', status: Number(t.status) }, 409)
-      const now = (await provider.getBlock('latest')).timestamp
-      if (now <= Number(t.deadline)) return c.json({ error: 'before_deadline', deadline: Number(t.deadline) }, 409)
-      const [filledSize] = await adapter.orderStatus(t.cloid)
-      if (BigNumber.from(filledSize).gte(t.size)) return c.json({ error: 'already_filled' }, 409)
-      const fee = checkFee(ext, relayer, isSell(side) ? cfg.minFeeBtc : cfg.minFeeUsdc)
-      if (!fee.ok) return c.json({ error: fee.error }, 400)
-      const method = isSell(side) ? 'cancelSell' : 'cancelTrade'
-      try {
-        await simulate(trader, method, [BigNumber.from(tradeId), proof, ext])
-      } catch (e) {
-        return c.json({ error: 'simulation_reverted', reason: extractRevert(e) }, 400)
+      if (rec) {
+        await recordTrade({
+          trader: cfg.trader,
+          tradeId: rec.tradeId.toString(),
+          account: String(rec.account).toLowerCase(),
+          assetCoreToken: Number(rec.assetCoreToken),
+          size: rec.size.toString(),
+          recipient: String(rec.recipient).toLowerCase(),
+          txHash: tx.hash,
+        })
       }
-      const tx = await send(trader, method, [BigNumber.from(tradeId), proof, ext], cfg.gasCancel)
-      await tx.wait(1)
-      return c.json({ txHash: tx.hash })
+      return c.json({ txHash: tx.hash, tradeId: rec ? rec.tradeId.toString() : undefined })
     } catch (e) {
       return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
     }
   })
 
-  app.post('/relay/withdraw', async (c) => {
+  // Shielded deposit/withdraw — standard mixer transact, fee paid in-token.
+  app.post('/relay/transact', async (c) => {
     try {
       const { proof, extData, pool } = await c.req.json()
-      if (!proof || !extData || (pool !== 'usdc' && pool !== 'btc'))
-        return c.json({ error: "proof/extData required, pool must be 'usdc'|'btc'" }, 400)
-      const fee = checkFee(extData, relayer, pool === 'btc' ? cfg.minFeeBtc : cfg.minFeeUsdc)
+      if (!proof || !extData || (pool !== 'usdc' && pool !== 'hype')) {
+        return c.json({ error: "proof/extData required, pool must be 'usdc'|'hype'" }, 400)
+      }
+      const fee = checkFee(extData, relayer, minFeeFor(pool))
       if (!fee.ok) return c.json({ error: fee.error }, 400)
-      const p = pools[pool as 'usdc' | 'btc']
+      const p = pools[pool]
       try {
         await simulate(p, 'transact', [proof, extData])
       } catch (e) {
@@ -237,6 +197,63 @@ export function mountRelay(app: Hono): boolean {
     }
   })
 
-  console.log(`Relayer enabled — signer ${relayer}, trader ${cfg.trader}`)
+  // ---------------------------------------------------------------- delivery worker
+  let core: ethers.Contract | null = null
+  const inFlight = new Set<string>()
+
+  const resolveCore = async (): Promise<ethers.Contract> => {
+    if (core) return core
+    const addr = cfg.coreGateway ?? (await trader.core())
+    core = new ethers.Contract(addr, CORE_ABI, provider)
+    return core
+  }
+
+  const deliverIfFilled = async (row: {
+    trade_id: string
+    account: string
+    asset_core_token: string
+    size: string
+  }): Promise<void> => {
+    const id = row.trade_id
+    if (inFlight.has(id)) return
+    inFlight.add(id)
+    try {
+      const c = await resolveCore()
+      const bal: BigNumber = await c.spotBalance(row.account, BigNumber.from(row.asset_core_token))
+      if (bal.lt(BigNumber.from(row.size))) return // not filled yet — never call deliver early
+      try {
+        await simulate(trader, 'deliver', [BigNumber.from(id)])
+      } catch (e) {
+        // already delivered / not open -> stop tracking; otherwise leave for next tick
+        if (alreadyDone(extractRevert(e))) await markDelivered(cfg.trader, id)
+        return
+      }
+      const tx = await send(trader, 'deliver', [BigNumber.from(id)], cfg.gasDeliver)
+      await tx.wait(1)
+      await markDelivered(cfg.trader, id)
+      console.log(`[relay] delivered trade ${id} -> ${tx.hash}`)
+    } catch (e) {
+      console.error(`[relay] deliver ${id} error:`, extractRevert(e))
+    } finally {
+      inFlight.delete(id)
+    }
+  }
+
+  const workerTick = async (): Promise<void> => {
+    try {
+      const rows = await openTrades(cfg.trader)
+      for (const row of rows) await deliverIfFilled(row)
+    } catch (e) {
+      console.error('[relay] worker tick error:', extractRevert(e))
+    }
+  }
+
+  initRelayStore()
+    .then(() => {
+      setInterval(workerTick, cfg.pollMs)
+      console.log(`Relayer enabled — signer ${relayer}, trader ${cfg.trader}, delivery worker every ${cfg.pollMs}ms`)
+    })
+    .catch((e) => console.error('[relay] store init failed:', extractRevert(e)))
+
   return true
 }
