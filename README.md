@@ -72,10 +72,11 @@ it a fee (≥ `MIN_FEE_USDC`/`MIN_FEE_BTC`), `callStatic`-simulates to reject
 reverts without burning gas, then signs+submits (serialized nonce, fixed gas for
 CoreWriter txs).
 
-- `POST /relay/initiate` `{ proof, extData, params, side:'buy'|'sell' }` → `{ txHash, tradeId, cloid }`
-- `POST /relay/settle` `{ tradeId, proof, ext, side }` (needs `orderStatus.filledSize >= size`, else `409`)
-- `POST /relay/cancel` `{ tradeId, proof, ext, side }` (needs `now > deadline` & not filled)
-- `POST /relay/withdraw` `{ proof, extData, pool:'usdc'|'btc' }`
+- `GET /relay/info` → `{ relayer, fees: { "<poolAddrLower>": "<feeBaseUnits>" } }`
+- `POST /relay/initiate` `{ proof, extData, p, side?:'buy'|'sell' }` → `{ tradeId, cloid, txHash }` (also accepts `params` for `p`)
+- `POST /relay/settle` `{ tradeId, proof, ext, side }` → `{ txHash }` (needs `orderStatus.filledSize >= size`, else `409`)
+- `POST /relay/cancel` `{ tradeId, proof, ext, side }` → `{ txHash }` (needs `now > deadline` & not filled)
+- `POST /relay/withdraw` `{ proof, extData, pool:'usdc'|'btc' }` → `{ txHash }`
 - `GET /relay/health`
 
 **Contract deltas (built to spec; current `feat/hypertrade` is behind):** sell

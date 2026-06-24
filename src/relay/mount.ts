@@ -130,10 +130,24 @@ export function mountRelay(app: Hono): boolean {
 
   app.get('/relay/health', (c) => c.json({ ok: true, relayer, trader: cfg.trader }))
 
+  // Frontend-facing info: relayer address + min fee per pool (base units, keyed
+  // by lowercased pool address) so the UI can build a fee the relayer accepts.
+  app.get('/relay/info', (c) =>
+    c.json({
+      relayer,
+      fees: {
+        [cfg.usdcPool]: cfg.minFeeUsdc.toString(),
+        [cfg.btcPool]: cfg.minFeeBtc.toString(),
+      },
+    }),
+  )
+
   app.post('/relay/initiate', async (c) => {
     try {
-      const { proof, extData, params, side } = await c.req.json()
-      if (!proof || !extData || !params) return c.json({ error: 'proof/extData/params required' }, 400)
+      const body = await c.req.json()
+      const { proof, extData, side } = body
+      const params = body.params ?? body.p // frontend sends `p`
+      if (!proof || !extData || !params) return c.json({ error: 'proof/extData/p required' }, 400)
       const fee = checkFee(extData, relayer, isSell(side) ? cfg.minFeeBtc : cfg.minFeeUsdc)
       if (!fee.ok) return c.json({ error: fee.error }, 400)
       const method = isSell(side) ? 'initiateSell' : 'initiateTrade'
@@ -145,7 +159,7 @@ export function mountRelay(app: Hono): boolean {
       const tx = await send(trader, method, [proof, extData, params], cfg.gasInitiate)
       const receipt = await tx.wait(1)
       const { tradeId, cloid } = parseInitEvent(receipt, isSell(side) ? 'SellInitiated' : 'TradeInitiated')
-      return c.json({ txHash: tx.hash, tradeId, cloid })
+      return c.json({ tradeId, cloid, txHash: tx.hash })
     } catch (e) {
       return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
     }
