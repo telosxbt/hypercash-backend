@@ -61,3 +61,26 @@ bun run src/index.ts   # migrates DB, starts indexer loops, serves API
 
 Dockerfile + `railway.json` (healthcheck `/health`). Attach a Postgres plugin
 (`DATABASE_URL` is injected); set `RPC_URL` and `POOLS`.
+
+## Relayer (`/relay/*`) — optional, same service
+
+A gasless verify+submit relayer is mounted on this service **only when
+`RELAYER_PRIVATE_KEY` (+ `TRADER_ADDRESS`, `USDC_POOL_ADDRESS`,
+`BTC_POOL_ADDRESS`, `ADAPTER_ADDRESS`) are set**. Otherwise the indexer/API runs
+unchanged. The frontend builds every proof; the relayer only checks the tx pays
+it a fee (≥ `MIN_FEE_USDC`/`MIN_FEE_BTC`), `callStatic`-simulates to reject
+reverts without burning gas, then signs+submits (serialized nonce, fixed gas for
+CoreWriter txs).
+
+- `POST /relay/initiate` `{ proof, extData, params, side:'buy'|'sell' }` → `{ txHash, tradeId, cloid }`
+- `POST /relay/settle` `{ tradeId, proof, ext, side }` (needs `orderStatus.filledSize >= size`, else `409`)
+- `POST /relay/cancel` `{ tradeId, proof, ext, side }` (needs `now > deadline` & not filled)
+- `POST /relay/withdraw` `{ proof, extData, pool:'usdc'|'btc' }`
+- `GET /relay/health`
+
+**Contract deltas (built to spec; current `feat/hypertrade` is behind):** sell
+side (`initiateSell`/`settleSell`/`cancelSell`/`sells`/`SellInitiated`) doesn't
+exist yet; `settle/cancel` currently take only `tradeId` (spec passes
+`(tradeId, proof, ext)` + BTC fee); `adapter.orderStatus` is a stub `(0,0)`.
+Buy + withdraw map to the current contract. Keep `src/relay/abis.ts` in sync with
+the deployed contract.
