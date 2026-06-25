@@ -26,6 +26,7 @@ interface RelayConfig {
   coreGateway?: string
   minFeeUsdc: BigNumber
   minFeeHype: BigNumber
+  minFeeDeposit: BigNumber
   gasTrade: number
   gasDeliver: number
   gasCancel: number
@@ -58,6 +59,9 @@ function loadRelayConfig(): RelayConfig | null {
     coreGateway: process.env.CORE_GATEWAY?.toLowerCase(),
     minFeeUsdc: BigNumber.from(process.env.MIN_FEE_USDC || '0'),
     minFeeHype: BigNumber.from(process.env.MIN_FEE_HYPE || '0'),
+    // Deposit fee defaults to 0 (gasless onboarding) so a first-time depositor
+    // isn't blocked by the trade fee; raise MIN_FEE_DEPOSIT to recover gas.
+    minFeeDeposit: BigNumber.from(process.env.MIN_FEE_DEPOSIT || '0'),
     gasTrade: envInt('GAS_TRADE', 2_500_000),
     gasDeliver: envInt('GAS_DELIVER', 2_000_000),
     gasCancel: envInt('GAS_CANCEL', 2_000_000),
@@ -235,6 +239,39 @@ export function mountRelay(app: Hono): boolean {
         return c.json({ error: 'simulation_reverted', reason: extractRevert(e) }, 400)
       }
       const tx = await send(p, 'transact', [proof, extData])
+      await tx.wait(1)
+      return c.json({ txHash: tx.hash })
+    } catch (e) {
+      return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
+    }
+  })
+
+  // Gasless USDC deposit. The user has no HYPE for gas: they sign an EIP-2612
+  // Permit (USDC allowance -> pool) + a deposit auth (binds them to their note)
+  // off-chain, and the relayer pays gas and submits depositWithPermit. USDC only.
+  app.post('/relay/deposit', async (c) => {
+    try {
+      const { proof, extData, permit } = await c.req.json()
+      if (!proof || !extData || !permit) return c.json({ error: 'proof/extData/permit required' }, 400)
+      // A fee only has to go to the relayer when one is set (min defaults to 0).
+      const hasFee = (() => {
+        try {
+          return BigNumber.from(extData.fee ?? 0).gt(0)
+        } catch {
+          return false
+        }
+      })()
+      if (cfg.minFeeDeposit.gt(0) || hasFee) {
+        const fee = checkFee(extData, relayer, cfg.minFeeDeposit)
+        if (!fee.ok) return c.json({ error: fee.error }, 400)
+      }
+      const p = pools.usdc
+      try {
+        await simulate(p, 'depositWithPermit', [proof, extData, permit])
+      } catch (e) {
+        return c.json({ error: 'simulation_reverted', reason: extractRevert(e) }, 400)
+      }
+      const tx = await send(p, 'depositWithPermit', [proof, extData, permit])
       await tx.wait(1)
       return c.json({ txHash: tx.hash })
     } catch (e) {

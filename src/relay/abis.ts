@@ -34,8 +34,16 @@ export const CORE_ABI = [
   'function szToWei(uint64 coreToken,uint64 sz) view returns (uint64)',
 ]
 
+// Gasless deposit permit bundle (USDC only). The user signs two things off-chain
+// (zero gas): an EIP-2612 Permit (USDC allowance -> pool) and a deposit auth that
+// binds them to their note (commitments + extAmount + deadline). The relayer pays
+// gas and submits depositWithPermit. Field order MUST match the deployed struct.
+const PERMIT =
+  'tuple(address owner,uint256 value,uint256 deadline,uint8 permitV,bytes32 permitR,bytes32 permitS,uint8 authV,bytes32 authR,bytes32 authS)'
+
 export const POOL_ABI = [
   `function transact(${PROOF} _args, ${EXTDATA} _extData)`,
+  `function depositWithPermit(${PROOF} _args, ${EXTDATA} _extData, ${PERMIT} _permit)`,
   'function token() view returns (address)',
 ]
 
