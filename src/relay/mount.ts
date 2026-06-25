@@ -254,7 +254,7 @@ export function mountRelay(app: Hono): boolean {
       const body = await c.req.json()
       const proof = body.proof ?? body.args // the front may name the ZK proof "args"
       const extData = body.extData ?? body.ext
-      const permit = body.permit ?? body.sigs
+      const permit = body.permit ?? body.auth ?? body.sigs
       if (!proof || !extData || !permit) {
         return c.json(
           { error: 'proof/extData/permit required', received: Object.keys(body ?? {}) },
