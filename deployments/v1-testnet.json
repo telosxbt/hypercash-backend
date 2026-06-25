@@ -1,0 +1,19 @@
+{
+  "network": "hyperevmTestnet",
+  "chainId": 998,
+  "note": "HyperCash v1 deployment (2026-06-25). Reference only — the live service is configured via Railway env vars (POOLS, TRADER_ADDRESS, USDC_POOL_ADDRESS, HYPE_POOL_ADDRESS, CORE_GATEWAY).",
+  "deployer": "0x6931c78E0C1D8f701EDca07095C91ee2ef33cAd3",
+  "verifier2": "0xbCF322Da649594E202F64314AE3956001E82e83e",
+  "hasher": "0xF850a632e3f25da715D37Fc3Bc1c57710596f1DC",
+  "trader": "0x5645f1d1933b7c3e8E481dF31A4C7329EE26DB83",
+  "core": "0x5BC2B726F97792c9D8CF46420e42694022f46055",
+  "coreWriter": "0x3333333333333333333333333333333333333333",
+  "tradeAccountImpl": "0x33B4EaF3B6c7829A3584b0Fa4b42bB466F612B75",
+  "defaultDeadlineSecs": 300,
+  "pools": {
+    "usdc": { "pool": "0xD0565a92Ff225f5bbaF1fc91D6450072E159C656", "token": "0x2B3370eE501B4a559b57D449569354196457D8Ab", "decimals": 6, "coreToken": 0 },
+    "btc":  { "pool": "0x08f4697541ba34aC20Ea9B82b72a2C4c7692a1f7", "token": "0x09f83c5052784c63603184e016e1db7a24626503", "decimals": 8 },
+    "eth":  { "pool": "0x9aBFd0A850998492425AC0b06558b5913e0A1eEA", "token": "0x5a1a1339ad9e52b7a4df78452d5c18e8690746f3", "decimals": 18 },
+    "hype": { "pool": "0x04EC02Cef83A22431bc329540a973c3582B472fA" }
+  }
+}
