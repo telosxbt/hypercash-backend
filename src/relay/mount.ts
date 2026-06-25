@@ -160,7 +160,13 @@ export function mountRelay(app: Hono): boolean {
         await simulate(trader, 'trade', [proof, extData, params])
       } catch (e) {
         const reason = extractRevert(e)
-        console.error('[relay] /relay/trade sim revert:', reason, '| params:', JSON.stringify(params))
+        let calldata = ''
+        try {
+          calldata = trader.interface.encodeFunctionData('trade', [proof, extData, params])
+        } catch {
+          /* ignore */
+        }
+        console.error('[relay] /relay/trade sim revert:', reason, '| to:', cfg.trader, '| calldata:', calldata)
         return c.json({ error: 'simulation_reverted', reason }, 400)
       }
       const tx = await send(trader, 'trade', [proof, extData, params], cfg.gasTrade)
