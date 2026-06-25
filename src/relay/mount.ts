@@ -223,16 +223,33 @@ export function mountRelay(app: Hono): boolean {
     }
   })
 
+  // Resolve the pool field to a key, accepting a label ('usdc'|'hype') or the
+  // pool's on-chain address (the front sends the address on some routes).
+  const resolvePoolKey = (pool: unknown): 'usdc' | 'hype' | null => {
+    const v = String(pool ?? '').toLowerCase()
+    if (v === 'usdc' || v === 'hype') return v
+    if (v === cfg.usdcPool) return 'usdc'
+    if (v === cfg.hypePool) return 'hype'
+    return null
+  }
+
   // Shielded deposit/withdraw — standard mixer transact, fee paid in-token.
-  app.post('/relay/transact', async (c) => {
+  // Exposed as both /relay/transact and /relay/withdraw (same on-chain call).
+  const handleTransact = async (c: any) => {
     try {
-      const { proof, extData, pool } = await c.req.json()
-      if (!proof || !extData || (pool !== 'usdc' && pool !== 'hype')) {
-        return c.json({ error: "proof/extData required, pool must be 'usdc'|'hype'" }, 400)
+      const body = await c.req.json()
+      const proof = body.proof ?? body.args
+      const extData = body.extData ?? body.ext
+      const key = resolvePoolKey(body.pool)
+      if (!proof || !extData || !key) {
+        return c.json(
+          { error: "proof/extData required, pool must be 'usdc'|'hype' or a pool address", received: Object.keys(body ?? {}) },
+          400,
+        )
       }
-      const fee = checkFee(extData, relayer, minFeeFor(pool))
+      const fee = checkFee(extData, relayer, minFeeFor(key))
       if (!fee.ok) return c.json({ error: fee.error }, 400)
-      const p = pools[pool]
+      const p = pools[key]
       try {
         await simulate(p, 'transact', [proof, extData])
       } catch (e) {
@@ -244,7 +261,9 @@ export function mountRelay(app: Hono): boolean {
     } catch (e) {
       return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
     }
-  })
+  }
+  app.post('/relay/transact', handleTransact)
+  app.post('/relay/withdraw', handleTransact)
 
   // Gasless USDC deposit. The user has no HYPE for gas: they sign an EIP-2612
   // Permit (USDC allowance -> pool) + a deposit auth (binds them to their note)
