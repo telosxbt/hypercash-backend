@@ -126,6 +126,43 @@ export function mountRelay(app: Hono): boolean {
   const simulate = (c: ethers.Contract, method: string, args: any[]) =>
     c.callStatic[method](...args, { from: relayer })
 
+  // On a trade() bare revert, localize the failure. trade() is a thin wrapper:
+  // validate params -> usdcPool.transact(proof,extData) (the ZK spend) -> bridge
+  // -> CoreWriter. If the ZK spend reverts standalone, the proof/root/nullifier
+  // (or extData routing) is bad. If it passes but trade() reverts, the failure
+  // is in the bridge/CoreWriter wrapper. We also surface where the withdrawn
+  // USDC is routed: extData.recipient MUST be the trader contract for the bridge
+  // to have funds — a common front bug is putting the delivery address there.
+  const diagnoseTrade = async (proof: any, extData: any, _params: any): Promise<Record<string, any>> => {
+    const out: Record<string, any> = {}
+    try {
+      out.extRecipient = String(extData.recipient)
+      out.extRecipientIsTrader = String(extData.recipient).toLowerCase() === cfg.trader
+      out.feeRecipient = String(extData.feeRecipient)
+      out.feeRecipientIsRelayer = String(extData.feeRecipient).toLowerCase() === relayer
+      out.fee = ethers.BigNumber.from(extData.fee).toString()
+      out.extAmount = ethers.BigNumber.from(extData.extAmount).toString()
+      out.proofRoot = String(proof.root)
+    } catch (e) {
+      out.decodeError = extractRevert(e)
+    }
+    // is the proof's merkle root currently valid on the USDC pool?
+    try {
+      const p = new ethers.Contract(cfg.usdcPool, [...POOL_ABI, 'function isKnownRoot(bytes32) view returns (bool)'], provider)
+      out.rootKnown = await p.isKnownRoot(proof.root)
+    } catch (e) {
+      out.rootKnownError = extractRevert(e)
+    }
+    // does the ZK spend itself pass, isolated from the bridge/CoreWriter wrapper?
+    try {
+      await pools.usdc.callStatic.transact(proof, extData, { from: relayer })
+      out.poolTransact = 'OK'
+    } catch (e) {
+      out.poolTransact = 'REVERT: ' + extractRevert(e)
+    }
+    return out
+  }
+
   // ---------------------------------------------------------------- routes
   app.get('/relay/health', (c) => c.json({ ok: true, relayer, trader: cfg.trader }))
 
@@ -160,14 +197,9 @@ export function mountRelay(app: Hono): boolean {
         await simulate(trader, 'trade', [proof, extData, params])
       } catch (e) {
         const reason = extractRevert(e)
-        let calldata = ''
-        try {
-          calldata = trader.interface.encodeFunctionData('trade', [proof, extData, params])
-        } catch {
-          /* ignore */
-        }
-        console.error('[relay] /relay/trade sim revert:', reason, '| to:', cfg.trader, '| calldata:', calldata)
-        return c.json({ error: 'simulation_reverted', reason }, 400)
+        const diag = await diagnoseTrade(proof, extData, params)
+        console.error('[relay] /relay/trade sim revert:', reason, '| to:', cfg.trader, '|', JSON.stringify(diag))
+        return c.json({ error: 'simulation_reverted', reason, diag }, 400)
       }
       const tx = await send(trader, 'trade', [proof, extData, params], cfg.gasTrade)
       const receipt = await tx.wait(1)
