@@ -11,9 +11,9 @@
 // recipient + venue are frozen on-chain at trade(): the relayer can't redirect.
 import type { Hono } from 'hono'
 import { ethers, BigNumber } from 'ethers'
-import { TRADER_ABI, CORE_ABI, POOL_ABI } from './abis'
+import { TRADER_ABI, CORE_ABI, POOL_ABI, STATUS } from './abis'
 import { checkFee } from './validate'
-import { initRelayStore, recordTrade, openTrades, markDelivered } from './store'
+import { initRelayStore, recordTrade, openTradeIds, markDone } from './store'
 
 interface RelayConfig {
   privateKey: string
@@ -27,6 +27,7 @@ interface RelayConfig {
   minFeeHype: BigNumber
   gasTrade: number
   gasDeliver: number
+  gasCancel: number
   pollMs: number
 }
 
@@ -58,6 +59,7 @@ function loadRelayConfig(): RelayConfig | null {
     minFeeHype: BigNumber.from(process.env.MIN_FEE_HYPE || '0'),
     gasTrade: envInt('GAS_TRADE', 2_500_000),
     gasDeliver: envInt('GAS_DELIVER', 2_000_000),
+    gasCancel: envInt('GAS_CANCEL', 2_000_000),
     pollMs: envInt('RELAY_POLL_MS', 8000),
   }
 }
@@ -148,27 +150,17 @@ export function mountRelay(app: Hono): boolean {
       }
       const tx = await send(trader, 'trade', [proof, extData, params], cfg.gasTrade)
       const receipt = await tx.wait(1)
-      let rec: any
+      let tradeId: string | undefined
       for (const log of receipt.logs ?? []) {
         try {
           const p = trader.interface.parseLog(log)
-          if (p.name === 'Traded') rec = p.args
+          if (p.name === 'Traded') tradeId = p.args.tradeId.toString()
         } catch {
           /* not ours */
         }
       }
-      if (rec) {
-        await recordTrade({
-          trader: cfg.trader,
-          tradeId: rec.tradeId.toString(),
-          account: String(rec.account).toLowerCase(),
-          assetCoreToken: Number(rec.assetCoreToken),
-          size: rec.size.toString(),
-          recipient: String(rec.recipient).toLowerCase(),
-          txHash: tx.hash,
-        })
-      }
-      return c.json({ txHash: tx.hash, tradeId: rec ? rec.tradeId.toString() : undefined })
+      if (tradeId) await recordTrade(cfg.trader, tradeId, tx.hash)
+      return c.json({ txHash: tx.hash, tradeId })
     } catch (e) {
       return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
     }
@@ -208,32 +200,33 @@ export function mountRelay(app: Hono): boolean {
     return core
   }
 
-  const deliverIfFilled = async (row: {
-    trade_id: string
-    account: string
-    asset_core_token: string
-    size: string
-  }): Promise<void> => {
-    const id = row.trade_id
+  // Finish a trade: deliver once filled, or cancel once past its deadline if not.
+  const finish = async (id: string, now: number): Promise<void> => {
     if (inFlight.has(id)) return
     inFlight.add(id)
     try {
-      const c = await resolveCore()
-      const bal: BigNumber = await c.spotBalance(row.account, BigNumber.from(row.asset_core_token))
-      if (bal.lt(BigNumber.from(row.size))) return // not filled yet — never call deliver early
-      try {
-        await simulate(trader, 'deliver', [BigNumber.from(id)])
-      } catch (e) {
-        // already delivered / not open -> stop tracking; otherwise leave for next tick
-        if (alreadyDone(extractRevert(e))) await markDelivered(cfg.trader, id)
+      const t = await trader.trades(BigNumber.from(id))
+      if (Number(t.status) !== STATUS.Open) {
+        await markDone(cfg.trader, id) // delivered or cancelled already
         return
       }
-      const tx = await send(trader, 'deliver', [BigNumber.from(id)], cfg.gasDeliver)
+      const c = await resolveCore()
+      const bal: BigNumber = await c.spotBalance(t.account, t.assetCoreToken)
+      const filled = bal.gte(t.size)
+      const action = filled ? 'deliver' : now > Number(t.deadline) ? 'cancel' : null
+      if (!action) return // not filled and not past deadline → wait
+      try {
+        await simulate(trader, action, [BigNumber.from(id)])
+      } catch (e) {
+        if (alreadyDone(extractRevert(e))) await markDone(cfg.trader, id)
+        return
+      }
+      const tx = await send(trader, action, [BigNumber.from(id)], action === 'deliver' ? cfg.gasDeliver : cfg.gasCancel)
       await tx.wait(1)
-      await markDelivered(cfg.trader, id)
-      console.log(`[relay] delivered trade ${id} -> ${tx.hash}`)
+      await markDone(cfg.trader, id)
+      console.log(`[relay] ${action} trade ${id} -> ${tx.hash}`)
     } catch (e) {
-      console.error(`[relay] deliver ${id} error:`, extractRevert(e))
+      console.error(`[relay] finish ${id} error:`, extractRevert(e))
     } finally {
       inFlight.delete(id)
     }
@@ -241,8 +234,10 @@ export function mountRelay(app: Hono): boolean {
 
   const workerTick = async (): Promise<void> => {
     try {
-      const rows = await openTrades(cfg.trader)
-      for (const row of rows) await deliverIfFilled(row)
+      const ids = await openTradeIds(cfg.trader)
+      if (!ids.length) return
+      const now = (await provider.getBlock('latest')).timestamp
+      for (const id of ids) await finish(id, now)
     } catch (e) {
       console.error('[relay] worker tick error:', extractRevert(e))
     }

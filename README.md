@@ -75,11 +75,15 @@ frontend builds every proof; the relayer checks the tx pays it a fee
    is charged here and must cover the gas of **both** `trade()` and the later
    `deliver()` — size `MIN_FEE_USDC` accordingly. Returns `{ txHash, tradeId }`;
    the trade (account, assetCoreToken, size, recipient) is persisted.
-2. **Delivery worker** polls every `RELAY_POLL_MS` (~8s): for each open trade,
-   reads `core.spotBalance(account, assetCoreToken)` (`core = trader.core()`);
-   once `>= size` it `callStatic`s then sends **TX2 `deliver(tradeId)`** (gas paid
-   by the relayer). Never calls `deliver` before the fill (async on HyperCore).
-   `deliver()` is permissionless + idempotent (DB status + status guard).
+2. **Delivery/cancel worker** polls every `RELAY_POLL_MS` (~8s): for each open
+   trade it reads `trades(tradeId)` (status/account/assetCoreToken/size/deadline)
+   and `core.spotBalance(account, assetCoreToken)` (`core = trader.core()`):
+   - once `spotBalance >= size` → `callStatic` then **TX2 `deliver(tradeId)`**
+   - else once `now > deadline` (still unfilled) → **`cancel(tradeId)`** (clean
+     exit on non-fills; refunds per the contract)
+   Gas paid by the relayer (covered by the upfront fee). Never delivers before
+   the fill (async on HyperCore). Both are permissionless + idempotent (on-chain
+   `status` + DB guard).
 
 Other endpoints:
 - `POST /relay/transact` `{ proof, extData, pool:'usdc'|'hype' }` → shielded
@@ -93,9 +97,14 @@ redirect; its only guard is `feeRecipient == relayer` + sufficient fee.
 ### Contract surface required (v1)
 
 Built against a v1 HyperTrader that must expose (keep `src/relay/abis.ts` in sync):
-- `trade(proof, extData, params) returns (uint256)` emitting
+- `trade(proof, extData, params)` (params incl. `deadline` uint64; 0 ⇒ now +
+  defaultDeadlineSecs) `returns (uint256)` emitting
   `Traded(uint256 indexed tradeId, address account, uint64 assetCoreToken, uint64 size, address recipient, uint128 cloid)`
-- `deliver(uint256 tradeId)` (permissionless; reverts if not filled / already delivered)
+- `deliver(uint256 tradeId)` (permissionless; reverts if not filled / already done)
+- `cancel(uint256 tradeId)` (permissionless; past deadline & unfilled) emitting
+  `Cancelled(uint256 indexed tradeId, address recipient, uint256 usdcRefunded, uint256 assetRefunded)`
+- `trades(uint256) view returns (account, recipient, assetCoreToken, size, venue, deadline, status)`
+  — status enum: 0 None, 1 Open, 2 Delivered, 3 Cancelled
 - `core() view returns (address)` → a gateway with `spotBalance(address, uint64) view returns (uint64)`
 - the pools' `transact(proof, extData)`
 
