@@ -251,8 +251,16 @@ export function mountRelay(app: Hono): boolean {
   // off-chain, and the relayer pays gas and submits depositWithPermit. USDC only.
   app.post('/relay/deposit', async (c) => {
     try {
-      const { proof, extData, permit } = await c.req.json()
-      if (!proof || !extData || !permit) return c.json({ error: 'proof/extData/permit required' }, 400)
+      const body = await c.req.json()
+      const proof = body.proof ?? body.args // the front may name the ZK proof "args"
+      const extData = body.extData ?? body.ext
+      const permit = body.permit ?? body.sigs
+      if (!proof || !extData || !permit) {
+        return c.json(
+          { error: 'proof/extData/permit required', received: Object.keys(body ?? {}) },
+          400,
+        )
+      }
       // A fee only has to go to the relayer when one is set (min defaults to 0).
       const hasFee = (() => {
         try {
