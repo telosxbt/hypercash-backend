@@ -65,9 +65,11 @@ function loadRelayConfig(): RelayConfig | null {
 }
 
 function extractRevert(e: any): string {
-  return String(
-    e?.error?.error?.message || e?.error?.message || e?.reason || e?.body || e?.message || e,
-  ).slice(0, 300)
+  // include raw revert data (custom-error selector) when no message is present
+  const data = e?.error?.data || e?.error?.error?.data || e?.data
+  const base =
+    e?.error?.error?.message || e?.error?.message || e?.reason || e?.body || e?.message || String(e)
+  return String(data ? `${base} | data=${typeof data === 'string' ? data : JSON.stringify(data)}` : base).slice(0, 400)
 }
 const alreadyDone = (msg: string) => /not open|already|delivered|settled|cancel/i.test(msg)
 
@@ -146,7 +148,9 @@ export function mountRelay(app: Hono): boolean {
       try {
         await simulate(trader, 'trade', [proof, extData, params])
       } catch (e) {
-        return c.json({ error: 'simulation_reverted', reason: extractRevert(e) }, 400)
+        const reason = extractRevert(e)
+        console.error('[relay] /relay/trade sim revert:', reason, '| params:', JSON.stringify(params))
+        return c.json({ error: 'simulation_reverted', reason }, 400)
       }
       const tx = await send(trader, 'trade', [proof, extData, params], cfg.gasTrade)
       const receipt = await tx.wait(1)
