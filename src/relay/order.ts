@@ -1,0 +1,74 @@
+// Turn the frontend's human-readable order into the on-chain TradeParams tuple.
+// The front sends { coin, recipient, usdcIn, size, szDecimals, limitPx, venue,
+// deadline } with size/limitPx human-readable; the relayer maps coin -> HyperCore
+// asset + formats sizes (its own design choice, #596).
+import { ethers, BigNumber } from 'ethers'
+
+// HL testnet spot mapping for the v1 buy assets (from spotMeta):
+//   asset          = order asset id (10000 + spot universe index)
+//   assetCoreToken = HyperCore spot token index (for spotBalance/delivery)
+//   szDecimals     = size decimals
+export const COIN_MAP: Record<string, { asset: number; assetCoreToken: number; szDecimals: number }> = {
+  ETH: { asset: 11137, assetCoreToken: 1242, szDecimals: 4 }, // UETH
+  BTC: { asset: 11054, assetCoreToken: 1129, szDecimals: 5 }, // UNIT
+  HYPE: { asset: 11035, assetCoreToken: 1105, szDecimals: 2 },
+}
+
+// HyperCore spot price integer = price * 10^(8 - szDecimals)  (spot MAX_DECIMALS = 8).
+const PX_MAX_DECIMALS = 8
+
+export interface HumanOrder {
+  coin: string
+  recipient: string
+  size: string | number
+  limitPx: string | number
+  venue?: number
+  deadline?: string | number
+  szDecimals?: number
+}
+
+export interface TradeParams {
+  asset: number
+  assetCoreToken: number
+  size: BigNumber
+  limitPx: BigNumber
+  cloid: BigNumber
+  recipient: string
+  venue: number
+  deadline: BigNumber
+}
+
+/** True if the payload is a human order (needs formatting) vs a ready tuple. */
+export function isHumanOrder(p: any): boolean {
+  return !!p && typeof p === 'object' && typeof p.coin === 'string'
+}
+
+export function randomCloid(): BigNumber {
+  return BigNumber.from(ethers.utils.randomBytes(16)) // uint128
+}
+
+export function buildTradeParams(order: HumanOrder, cloid: BigNumber): TradeParams {
+  const coin = String(order.coin).toUpperCase()
+  const m = COIN_MAP[coin]
+  if (!m) throw new Error(`unknown coin "${order.coin}"`)
+  if (!ethers.utils.isAddress(order.recipient)) throw new Error('invalid recipient')
+
+  const szDec = m.szDecimals
+  // parseUnits handles the decimal string safely (no float drift) and rejects
+  // over-precise inputs.
+  const size = ethers.utils.parseUnits(String(order.size), szDec)
+  const limitPx = ethers.utils.parseUnits(String(order.limitPx), PX_MAX_DECIMALS - szDec)
+  if (size.lte(0)) throw new Error('size must be > 0')
+  if (limitPx.lte(0)) throw new Error('limitPx must be > 0')
+
+  return {
+    asset: m.asset,
+    assetCoreToken: m.assetCoreToken,
+    size,
+    limitPx,
+    cloid,
+    recipient: order.recipient,
+    venue: order.venue ?? 0,
+    deadline: BigNumber.from(order.deadline ?? 0),
+  }
+}

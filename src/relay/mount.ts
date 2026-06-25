@@ -14,6 +14,7 @@ import { ethers, BigNumber } from 'ethers'
 import { TRADER_ABI, CORE_ABI, POOL_ABI, STATUS } from './abis'
 import { checkFee } from './validate'
 import { initRelayStore, recordTrade, openTradeIds, markDone } from './store'
+import { isHumanOrder, buildTradeParams, randomCloid } from './order'
 
 interface RelayConfig {
   privateKey: string
@@ -141,10 +142,20 @@ export function mountRelay(app: Hono): boolean {
     try {
       const body = await c.req.json()
       const { proof, extData } = body
-      const params = body.params ?? body.p ?? body.order
+      let params = body.params ?? body.p ?? body.order
       if (!proof || !extData || !params) return c.json({ error: 'proof/extData/params required' }, 400)
       const fee = checkFee(extData, relayer, cfg.minFeeUsdc)
       if (!fee.ok) return c.json({ error: fee.error }, 400)
+      // The front sends a human order { coin, size, limitPx, … }; map coin -> asset
+      // + format sizes into the on-chain TradeParams tuple. (Already-formatted
+      // tuples are passed through.)
+      if (isHumanOrder(params)) {
+        try {
+          params = buildTradeParams(params, randomCloid())
+        } catch (e) {
+          return c.json({ error: 'bad_order', reason: extractRevert(e) }, 400)
+        }
+      }
       try {
         await simulate(trader, 'trade', [proof, extData, params])
       } catch (e) {
