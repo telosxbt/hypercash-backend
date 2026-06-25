@@ -223,6 +223,42 @@ export function mountRelay(app: Hono): boolean {
     }
   })
 
+  // Localize a transact (deposit/withdraw) revert: the usual culprits are a
+  // stale merkle root (proof built against an old tree), an already-spent
+  // nullifier (double-spend / re-submitted note), or extAmount/fee not matching
+  // publicAmount. We can't trace, but root-known + spent-nullifier are readable.
+  const diagnoseTransact = async (p: ethers.Contract, proof: any, extData: any): Promise<Record<string, any>> => {
+    const out: Record<string, any> = {}
+    try {
+      out.root = String(proof.root)
+      out.recipient = String(extData.recipient)
+      out.extAmount = ethers.BigNumber.from(extData.extAmount).toString()
+      out.fee = ethers.BigNumber.from(extData.fee).toString()
+      out.feeRecipient = String(extData.feeRecipient)
+      out.publicAmount = String(proof.publicAmount)
+    } catch (e) {
+      out.decodeError = extractRevert(e)
+    }
+    const probe = new ethers.Contract(
+      p.address,
+      ['function isKnownRoot(bytes32) view returns (bool)', 'function isSpent(bytes32) view returns (bool)'],
+      provider,
+    )
+    try {
+      out.rootKnown = await probe.isKnownRoot(proof.root)
+    } catch (e) {
+      out.rootKnownError = extractRevert(e)
+    }
+    try {
+      out.nullifiersSpent = await Promise.all(
+        (proof.inputNullifiers ?? []).map((n: string) => probe.isSpent(n).catch(() => 'n/a')),
+      )
+    } catch (e) {
+      out.spentError = extractRevert(e)
+    }
+    return out
+  }
+
   // Resolve the pool field to a key, accepting a label ('usdc'|'hype') or the
   // pool's on-chain address (the front sends the address on some routes).
   const resolvePoolKey = (pool: unknown): 'usdc' | 'hype' | null => {
@@ -253,7 +289,10 @@ export function mountRelay(app: Hono): boolean {
       try {
         await simulate(p, 'transact', [proof, extData])
       } catch (e) {
-        return c.json({ error: 'simulation_reverted', reason: extractRevert(e) }, 400)
+        const reason = extractRevert(e)
+        const diag = await diagnoseTransact(p, proof, extData)
+        console.error('[relay] /relay/withdraw|transact sim revert:', reason, '| pool:', key, '|', JSON.stringify(diag))
+        return c.json({ error: 'simulation_reverted', reason, diag }, 400)
       }
       const tx = await send(p, 'transact', [proof, extData])
       await tx.wait(1)
