@@ -11,7 +11,7 @@
 // recipient + venue are frozen on-chain at trade(): the relayer can't redirect.
 import type { Hono } from 'hono'
 import { ethers, BigNumber } from 'ethers'
-import { TRADER_ABI, CORE_ABI, POOL_ABI, STATUS } from './abis'
+import { TRADER_ABI, CORE_ABI, POOL_ABI, ERC20_PERMIT_ABI, STATUS } from './abis'
 import { checkFee } from './validate'
 import { initRelayStore, recordTrade, openTradeIds, markDone } from './store'
 import { isHumanOrder, buildTradeParams, randomCloid } from './order'
@@ -27,6 +27,7 @@ interface RelayConfig {
   minFeeUsdc: BigNumber
   minFeeHype: BigNumber
   minFeeDeposit: BigNumber
+  bridgeFee: BigNumber
   gasTrade: number
   gasDeliver: number
   gasCancel: number
@@ -62,6 +63,10 @@ function loadRelayConfig(): RelayConfig | null {
     // Deposit fee defaults to 0 (gasless onboarding) so a first-time depositor
     // isn't blocked by the trade fee; raise MIN_FEE_DEPOSIT to recover gas.
     minFeeDeposit: BigNumber.from(process.env.MIN_FEE_DEPOSIT || '0'),
+    // Flat fee (in the withdrawn token's units) the relayer keeps on
+    // /relay/withdrawToCore to cover the permit + 2 transferFrom gas. The bridged
+    // amount sent to HyperCore is value - bridgeFee. Defaults to 0.
+    bridgeFee: BigNumber.from(process.env.BRIDGE_FEE || '0'),
     gasTrade: envInt('GAS_TRADE', 2_500_000),
     gasDeliver: envInt('GAS_DELIVER', 2_000_000),
     gasCancel: envInt('GAS_CANCEL', 2_000_000),
@@ -77,6 +82,16 @@ function extractRevert(e: any): string {
   return String(data ? `${base} | data=${typeof data === 'string' ? data : JSON.stringify(data)}` : base).slice(0, 400)
 }
 const alreadyDone = (msg: string) => /not open|already|delivered|settled|cancel/i.test(msg)
+
+// HyperCore spot bridge: sending a linked ERC20 to this per-token system address
+// credits the owner's HyperCore spot balance. The address is the fixed base
+// 0x2000…0000 plus the token's core index. (Same scheme HyperCore uses for
+// EVM->Core token transfers.)
+const CORE_SYSTEM_BASE = BigNumber.from('0x2000000000000000000000000000000000000000')
+function systemAddr(coreToken: ethers.BigNumberish): string {
+  const raw = CORE_SYSTEM_BASE.add(BigNumber.from(coreToken)).toHexString()
+  return ethers.utils.getAddress(ethers.utils.hexZeroPad(raw, 20))
+}
 
 export function mountRelay(app: Hono): boolean {
   const cfg = loadRelayConfig()
@@ -340,6 +355,109 @@ export function mountRelay(app: Hono): boolean {
       const tx = await send(p, 'depositWithPermit', [proof, extData, permit])
       await tx.wait(1)
       return c.json({ txHash: tx.hash })
+    } catch (e) {
+      return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
+    }
+  })
+
+  // Shielded withdraw straight to HyperCore spot. Mirrors /relay/deposit but the
+  // other way: (a) pool.transact(proof,extData) unshields the funds to the owner;
+  // (b) the owner's EIP-2612 Permit lets the relayer move them; (c) transferFrom
+  // (value - bridgeFee) to the token's HyperCore system address (the spot bridge);
+  // (d) transferFrom the bridgeFee to the relayer as gas comp.
+  app.post('/relay/withdrawToCore', async (c) => {
+    try {
+      const body = await c.req.json()
+      const proof = body.proof ?? body.args
+      const extData = body.extData ?? body.ext
+      const permit = body.permit ?? body.auth
+      const key = resolvePoolKey(body.pool)
+      const coreToken = body.coreToken
+      if (!proof || !extData || !permit || !key || coreToken === undefined || coreToken === null) {
+        return c.json(
+          {
+            error: "proof/extData/permit/coreToken required, pool must be 'usdc'|'hype' or a pool address",
+            received: Object.keys(body ?? {}),
+          },
+          400,
+        )
+      }
+      // The Permit must authorize the relayer (it is msg.sender of transferFrom).
+      if (permit.spender && String(permit.spender).toLowerCase() !== relayer) {
+        return c.json({ error: 'permit.spender must be the relayer', relayer }, 400)
+      }
+      // The withdrawn-token amount the owner permits must cover the bridge fee.
+      let value: BigNumber
+      try {
+        value = BigNumber.from(permit.value)
+      } catch {
+        return c.json({ error: 'invalid permit.value' }, 400)
+      }
+      const bridgeAmount = value.sub(cfg.bridgeFee)
+      if (bridgeAmount.lte(0)) {
+        return c.json({ error: `permit.value ${value.toString()} must exceed bridgeFee ${cfg.bridgeFee.toString()}` }, 400)
+      }
+      // An in-note fee (paid to the relayer in-token) is optional here — the
+      // relayer is normally paid via bridgeFee — but if one is set it must be ours.
+      const hasNoteFee = (() => {
+        try {
+          return BigNumber.from(extData.fee ?? 0).gt(0)
+        } catch {
+          return false
+        }
+      })()
+      if (minFeeFor(key).gt(0) || hasNoteFee) {
+        const fee = checkFee(extData, relayer, minFeeFor(key))
+        if (!fee.ok) return c.json({ error: fee.error }, 400)
+      }
+
+      const p = pools[key]
+      // (a) unshield: pool.transact lands the funds at extData.recipient (the owner).
+      try {
+        await simulate(p, 'transact', [proof, extData])
+      } catch (e) {
+        const reason = extractRevert(e)
+        const diag = await diagnoseTransact(p, proof, extData)
+        console.error('[relay] /relay/withdrawToCore transact sim revert:', reason, '| pool:', key, '|', JSON.stringify(diag))
+        return c.json({ error: 'simulation_reverted', reason, diag }, 400)
+      }
+      const withdrawTx = await send(p, 'transact', [proof, extData])
+      await withdrawTx.wait(1)
+
+      // The pool's underlying ERC20 is what the owner now holds and what we bridge.
+      const tokenAddr: string = await p.token()
+      const token = new ethers.Contract(tokenAddr, ERC20_PERMIT_ABI, wallet)
+
+      try {
+        // (b) permit: owner -> relayer allowance for `value`.
+        const permitTx = await send(token, 'permit', [
+          permit.owner,
+          relayer,
+          value,
+          permit.deadline,
+          permit.v,
+          permit.r,
+          permit.s,
+        ])
+        await permitTx.wait(1)
+
+        // (c) bridge: transferFrom(owner -> systemAddr(coreToken), value - bridgeFee).
+        const bridgeTx = await send(token, 'transferFrom', [permit.owner, systemAddr(coreToken), bridgeAmount])
+        await bridgeTx.wait(1)
+
+        // (d) relayer gas comp: transferFrom(owner -> relayer, bridgeFee).
+        if (cfg.bridgeFee.gt(0)) {
+          const feeTx = await send(token, 'transferFrom', [permit.owner, relayer, cfg.bridgeFee])
+          await feeTx.wait(1)
+        }
+
+        return c.json({ withdrawTxHash: withdrawTx.hash, bridgeTxHash: bridgeTx.hash })
+      } catch (e) {
+        // The unshield already mined; surface that so the funds aren't presumed lost.
+        const reason = extractRevert(e)
+        console.error('[relay] /relay/withdrawToCore bridge leg failed after withdraw', withdrawTx.hash, ':', reason)
+        return c.json({ error: 'bridge_failed', reason, withdrawTxHash: withdrawTx.hash }, 500)
+      }
     } catch (e) {
       return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
     }

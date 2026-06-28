@@ -92,3 +92,56 @@ test('/relay/transact rejects a bad pool', async () => {
   })
   expect(res.status).toBe(400)
 })
+
+test('/relay/withdrawToCore validates payload (needs coreToken)', async () => {
+  enable()
+  const app = new Hono()
+  mountRelay(app)
+  const res = await app.request('/relay/withdrawToCore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ proof: {}, extData: {}, permit: {}, pool: 'usdc' }),
+  })
+  expect(res.status).toBe(400)
+  expect(((await res.json()) as any).error).toContain('coreToken')
+})
+
+test('/relay/withdrawToCore rejects a permit.spender that is not the relayer', async () => {
+  enable()
+  const app = new Hono()
+  mountRelay(app)
+  const res = await app.request('/relay/withdrawToCore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      proof: {},
+      extData: {},
+      pool: 'usdc',
+      coreToken: 0,
+      permit: { owner: '0xdead000000000000000000000000000000000000', spender: '0xdead000000000000000000000000000000000000', value: '1000', deadline: 0, v: 27, r: '0x', s: '0x' },
+    }),
+  })
+  expect(res.status).toBe(400)
+  expect(((await res.json()) as any).error).toContain('spender')
+})
+
+test('/relay/withdrawToCore rejects permit.value <= bridgeFee', async () => {
+  enable()
+  process.env.BRIDGE_FEE = '1000'
+  const app = new Hono()
+  mountRelay(app)
+  const res = await app.request('/relay/withdrawToCore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      proof: {},
+      extData: {},
+      pool: 'usdc',
+      coreToken: 0,
+      permit: { owner: '0xdead000000000000000000000000000000000000', value: '500', deadline: 0, v: 27, r: '0x', s: '0x' },
+    }),
+  })
+  expect(res.status).toBe(400)
+  expect(((await res.json()) as any).error).toContain('bridgeFee')
+  delete process.env.BRIDGE_FEE
+})

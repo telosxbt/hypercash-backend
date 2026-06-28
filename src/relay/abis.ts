@@ -47,5 +47,17 @@ export const POOL_ABI = [
   'function token() view returns (address)',
 ]
 
+// Underlying pool ERC20, used by /relay/withdrawToCore. After the shielded
+// withdraw lands the funds at the owner, the owner's EIP-2612 Permit lets the
+// relayer transferFrom() the withdrawn amount: (value - bridgeFee) to the
+// HyperCore system address (the spot bridge) and bridgeFee to the relayer.
+export const ERC20_PERMIT_ABI = [
+  'function permit(address owner,address spender,uint256 value,uint256 deadline,uint8 v,bytes32 r,bytes32 s)',
+  'function transferFrom(address from,address to,uint256 amount) returns (bool)',
+  'function balanceOf(address owner) view returns (uint256)',
+  'function allowance(address owner,address spender) view returns (uint256)',
+  'function nonces(address owner) view returns (uint256)',
+]
+
 // Trade.status enum (matches the contract): 0 None, 1 Open, 2 Delivered, 3 Cancelled.
 export const STATUS = { None: 0, Open: 1, Delivered: 2, Cancelled: 3 } as const
