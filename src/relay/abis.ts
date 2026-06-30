@@ -57,6 +57,7 @@ export const ERC20_PERMIT_ABI = [
   'function balanceOf(address owner) view returns (uint256)',
   'function allowance(address owner,address spender) view returns (uint256)',
   'function nonces(address owner) view returns (uint256)',
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
 ]
 
 // CoreWriter (HyperCore system contract) — spot-send action (id 6) lets the

@@ -583,16 +583,28 @@ export function mountRelay(app: Hono): boolean {
       // Serialize the whole job so the EVM-received and Core-credited deltas are
       // measured against a quiet bridge wallet (no concurrent job interleaving).
       return await withJobLock(async () => {
-        // (a) unshield -> bridge wallet. Measure the ERC20 received.
-        const tokBefore: BigNumber = await token.balanceOf(bridgeAddr)
+        // (a) unshield -> bridge wallet. The amount received is taken from THIS
+        // tx's own Transfer(_, bridge, value) logs — authoritative per-tx, so two
+        // jobs can never attribute each other's funds (a balance snapshot could
+        // be skewed by anything else hitting the wallet; a receipt can't).
         const coreBefore: BigNumber = await core.spotBalance(bridgeAddr, BigNumber.from(coreToken))
         const withdrawTx = await send(p, 'transact', [proof, extData])
-        await withdrawTx.wait(1)
-        const tokAfter: BigNumber = await token.balanceOf(bridgeAddr)
-        const received = tokAfter.sub(tokBefore)
+        const receipt = await withdrawTx.wait(1)
+        let received = BigNumber.from(0)
+        for (const log of receipt.logs ?? []) {
+          if (log.address.toLowerCase() !== tokenAddr.toLowerCase()) continue
+          try {
+            const parsed = token.interface.parseLog(log)
+            if (parsed.name === 'Transfer' && String(parsed.args.to).toLowerCase() === bridgeAddr) {
+              received = received.add(parsed.args.value)
+            }
+          } catch {
+            /* not a Transfer log */
+          }
+        }
         if (received.lte(0)) {
-          console.error('[relay] /relay/withdrawToCore: no ERC20 received at bridge after', withdrawTx.hash)
-          return c.json({ error: 'bridge_failed', reason: 'no funds received at bridge wallet', withdrawTxHash: withdrawTx.hash }, 500)
+          console.error('[relay] /relay/withdrawToCore: tx delivered no funds to bridge', withdrawTx.hash)
+          return c.json({ error: 'bridge_failed', reason: 'withdraw tx delivered no funds to the bridge wallet', withdrawTxHash: withdrawTx.hash }, 500)
         }
 
         // Journal the job BEFORE the bridge/spotSend legs so a crash leaves a
