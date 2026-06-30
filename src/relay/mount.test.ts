@@ -16,6 +16,9 @@ beforeAll(async () => {
   ;({ mountRelay } = await import('./mount'))
 })
 
+// A second key for the HL_SPOT_BRIDGE transit wallet (distinct from the relayer).
+const BRIDGE_KEY = '0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba'
+
 function enable() {
   process.env.RELAYER_PRIVATE_KEY =
     '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'
@@ -25,6 +28,7 @@ function enable() {
   process.env.HYPE_POOL_ADDRESS = HYPE
   process.env.MIN_FEE_USDC = '1000'
   process.env.MIN_FEE_HYPE = '7'
+  process.env.HL_SPOT_BRIDGE_PRIVATE_KEY = BRIDGE_KEY
 }
 
 test('disabled without RELAYER_PRIVATE_KEY', () => {
@@ -93,20 +97,24 @@ test('/relay/transact rejects a bad pool', async () => {
   expect(res.status).toBe(400)
 })
 
-test('/relay/withdrawToCore validates payload (needs coreToken)', async () => {
+const DEST = '0x6931c78E0C1D8f701EDca07095C91ee2ef33cAd3'
+
+test('/relay/withdrawToCore validates payload (needs coreToken + destination)', async () => {
   enable()
   const app = new Hono()
   mountRelay(app)
   const res = await app.request('/relay/withdrawToCore', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ proof: {}, extData: {}, permit: {}, pool: 'usdc' }),
+    body: JSON.stringify({ proof: {}, extData: {}, pool: 'usdc' }),
   })
   expect(res.status).toBe(400)
-  expect(((await res.json()) as any).error).toContain('coreToken')
+  const j = (await res.json()) as any
+  expect(j.error).toContain('coreToken')
+  expect(j.error).toContain('destination')
 })
 
-test('/relay/withdrawToCore rejects a permit.spender that is not the relayer', async () => {
+test('/relay/withdrawToCore rejects recipient that is not the bridge wallet', async () => {
   enable()
   const app = new Hono()
   mountRelay(app)
@@ -115,33 +123,26 @@ test('/relay/withdrawToCore rejects a permit.spender that is not the relayer', a
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       proof: {},
-      extData: {},
+      extData: { recipient: '0xdead000000000000000000000000000000000000' },
       pool: 'usdc',
       coreToken: 0,
-      permit: { owner: '0xdead000000000000000000000000000000000000', spender: '0xdead000000000000000000000000000000000000', value: '1000', deadline: 0, v: 27, r: '0x', s: '0x' },
+      destination: DEST,
     }),
   })
   expect(res.status).toBe(400)
-  expect(((await res.json()) as any).error).toContain('spender')
+  expect(((await res.json()) as any).error).toContain('recipient')
 })
 
-test('/relay/withdrawToCore rejects permit.value <= bridgeFee', async () => {
+test('/relay/withdrawToCore is 503 when HL_SPOT_BRIDGE is not configured', async () => {
   enable()
-  process.env.BRIDGE_FEE = '1000'
+  delete process.env.HL_SPOT_BRIDGE_PRIVATE_KEY
   const app = new Hono()
   mountRelay(app)
   const res = await app.request('/relay/withdrawToCore', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      proof: {},
-      extData: {},
-      pool: 'usdc',
-      coreToken: 0,
-      permit: { owner: '0xdead000000000000000000000000000000000000', value: '500', deadline: 0, v: 27, r: '0x', s: '0x' },
-    }),
+    body: JSON.stringify({ proof: {}, extData: { recipient: DEST }, pool: 'usdc', coreToken: 0, destination: DEST }),
   })
-  expect(res.status).toBe(400)
-  expect(((await res.json()) as any).error).toContain('bridgeFee')
-  delete process.env.BRIDGE_FEE
+  expect(res.status).toBe(503)
+  expect(((await res.json()) as any).error).toContain('HL_SPOT_BRIDGE')
 })

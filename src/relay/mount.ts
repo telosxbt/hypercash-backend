@@ -11,7 +11,7 @@
 // recipient + venue are frozen on-chain at trade(): the relayer can't redirect.
 import type { Hono } from 'hono'
 import { ethers, BigNumber } from 'ethers'
-import { TRADER_ABI, CORE_ABI, POOL_ABI, ERC20_PERMIT_ABI, STATUS } from './abis'
+import { TRADER_ABI, CORE_ABI, POOL_ABI, ERC20_PERMIT_ABI, CORE_WRITER, CORE_WRITER_ABI, STATUS } from './abis'
 import { checkFee } from './validate'
 import { initRelayStore, recordTrade, openTradeIds, markDone } from './store'
 import { isHumanOrder, buildTradeParams, randomCloid } from './order'
@@ -93,6 +93,18 @@ function systemAddr(coreToken: ethers.BigNumberish): string {
   return ethers.utils.getAddress(ethers.utils.hexZeroPad(raw, 20))
 }
 
+// CoreWriter spot-send (action id 6): header (version 1 + 24-bit action id) then
+// abi(address destination, uint64 coreToken, uint64 weiAmount). Mirrors the
+// frontend bridge encoder / contracts' CoreWriterLib.
+function encodeSpotSend(destination: string, coreToken: ethers.BigNumberish, weiAmount: ethers.BigNumberish): string {
+  const header = ethers.utils.solidityPack(['uint8', 'uint24'], [1, 6])
+  const body = ethers.utils.defaultAbiCoder.encode(
+    ['address', 'uint64', 'uint64'],
+    [destination, BigNumber.from(coreToken), BigNumber.from(weiAmount)],
+  )
+  return ethers.utils.hexConcat([header, body])
+}
+
 export function mountRelay(app: Hono): boolean {
   const cfg = loadRelayConfig()
   if (!cfg) {
@@ -145,6 +157,72 @@ export function mountRelay(app: Hono): boolean {
   const simulate = (c: ethers.Contract, method: string, args: any[]) =>
     c.callStatic[method](...args, { from: relayer })
 
+  // ---- HL_SPOT_BRIDGE hot wallet (for /relay/withdrawToCore) ----------------
+  // A dedicated transit wallet. Funds for a "withdraw to HyperCore spot of an
+  // arbitrary address" are unshielded TO this wallet, then it bridges them to
+  // Core and spotSends to the destination. Because every user's funds transit
+  // through the SAME wallet, the whole sequence is serialized (one job at a time)
+  // and each job only forwards the exact Core balance delta its own bridge
+  // credited — so we can never send another user's money. Optional: the route is
+  // disabled until HL_SPOT_BRIDGE_PRIVATE_KEY is set.
+  const bridgeKey = process.env.HL_SPOT_BRIDGE_PRIVATE_KEY
+  const bridgeWallet = bridgeKey ? new ethers.Wallet(bridgeKey, provider) : null
+  const bridgeAddr = bridgeWallet ? bridgeWallet.address.toLowerCase() : null
+  const gasBridgeTransfer = envInt('GAS_BRIDGE_TRANSFER', 300_000)
+  const gasBridgeSpotSend = envInt('GAS_BRIDGE_SPOTSEND', 2_000_000)
+  const bridgePollMs = envInt('BRIDGE_CREDIT_POLL_MS', 3000)
+  const bridgePollTries = envInt('BRIDGE_CREDIT_POLL_TRIES', 25)
+
+  // Independent nonce lock for the bridge wallet's own EVM txs (it's a separate
+  // signer from the main relayer, so it needs its own serialized nonce).
+  let bridgeLock: Promise<void> = Promise.resolve()
+  let bridgeNonce: number | null = null
+  async function bridgeSendTx(to: string, data: string, gasLimit: number): Promise<ethers.providers.TransactionResponse> {
+    const prev = bridgeLock
+    let release!: () => void
+    bridgeLock = new Promise<void>((r) => (release = r))
+    await prev
+    try {
+      if (bridgeNonce === null) bridgeNonce = await provider.getTransactionCount(bridgeAddr!, 'pending')
+      try {
+        const tx = await bridgeWallet!.sendTransaction({ to, data, gasLimit, nonce: bridgeNonce })
+        bridgeNonce = (bridgeNonce as number) + 1
+        return tx
+      } catch (e) {
+        bridgeNonce = null
+        throw e
+      }
+    } finally {
+      release()
+    }
+  }
+
+  // Whole-job queue: serializes each withdrawToCore end-to-end so the per-job
+  // balance deltas (EVM received, Core credited) are never corrupted by a
+  // concurrent job sharing the bridge wallet.
+  let jobLock: Promise<void> = Promise.resolve()
+  async function withJobLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = jobLock
+    let release!: () => void
+    jobLock = new Promise<void>((r) => (release = r))
+    await prev
+    try {
+      return await fn()
+    } finally {
+      release()
+    }
+  }
+
+  // Core spot-balance reader (HyperCoreView / gateway). Cached.
+  let coreRead: ethers.Contract | null = null
+  const getCoreRead = async (): Promise<ethers.Contract> => {
+    if (coreRead) return coreRead
+    const addr = cfg.coreGateway ?? (await trader.core())
+    coreRead = new ethers.Contract(addr, CORE_ABI, provider)
+    return coreRead
+  }
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
   // On a trade() bare revert, localize the failure. trade() is a thin wrapper:
   // validate params -> usdcPool.transact(proof,extData) (the ZK spend) -> bridge
   // -> CoreWriter. If the ZK spend reverts standalone, the proof/root/nullifier
@@ -183,12 +261,15 @@ export function mountRelay(app: Hono): boolean {
   }
 
   // ---------------------------------------------------------------- routes
-  app.get('/relay/health', (c) => c.json({ ok: true, relayer, trader: cfg.trader }))
+  app.get('/relay/health', (c) => c.json({ ok: true, relayer, trader: cfg.trader, spotBridge: bridgeAddr }))
 
   app.get('/relay/info', (c) =>
     c.json({
       relayer,
       trader: cfg.trader,
+      // The HL_SPOT_BRIDGE wallet — the front MUST set extData.recipient to this
+      // for /relay/withdrawToCore (funds transit through it). null = route off.
+      spotBridge: bridgeAddr,
       fees: { [cfg.usdcPool]: cfg.minFeeUsdc.toString(), [cfg.hypePool]: cfg.minFeeHype.toString() },
     }),
   )
@@ -360,45 +441,54 @@ export function mountRelay(app: Hono): boolean {
     }
   })
 
-  // Shielded withdraw straight to HyperCore spot. Mirrors /relay/deposit but the
-  // other way: (a) pool.transact(proof,extData) unshields the funds to the owner;
-  // (b) the owner's EIP-2612 Permit lets the relayer move them; (c) transferFrom
-  // (value - bridgeFee) to the token's HyperCore system address (the spot bridge);
-  // (d) transferFrom the bridgeFee to the relayer as gas comp.
+  // Shielded withdraw straight to a HyperCore spot address the user does NOT need
+  // to control (no permit — permit can't authorize sending to a foreign wallet).
+  // The funds transit through the shared HL_SPOT_BRIDGE hot wallet:
+  //   (a) pool.transact(proof,extData) unshields TO the bridge wallet
+  //       (extData.recipient MUST be the bridge wallet);
+  //   (b) bridge wallet transfer()s the received ERC20 to systemAddr(coreToken)
+  //       → credits the bridge wallet's Core spot balance;
+  //   (c) once Core credits (poll the spot-balance delta), the bridge wallet
+  //       CoreWriter-spotSends exactly that delta to the destination.
+  // The whole job is serialized (withJobLock) and only forwards its OWN measured
+  // delta, so one user's funds can never be sent to another's destination.
   app.post('/relay/withdrawToCore', async (c) => {
     try {
       const body = await c.req.json()
       const proof = body.proof ?? body.args
       const extData = body.extData ?? body.ext
-      const permit = body.permit ?? body.auth
       const key = resolvePoolKey(body.pool)
       const coreToken = body.coreToken
-      if (!proof || !extData || !permit || !key || coreToken === undefined || coreToken === null) {
+      const destination = body.destination ?? body.to
+      if (
+        !proof ||
+        !extData ||
+        !key ||
+        coreToken === undefined ||
+        coreToken === null ||
+        !destination
+      ) {
         return c.json(
           {
-            error: "proof/extData/permit/coreToken required, pool must be 'usdc'|'hype' or a pool address",
+            error: "proof/extData/coreToken/destination required, pool must be 'usdc'|'hype' or a pool address",
             received: Object.keys(body ?? {}),
           },
           400,
         )
       }
-      // The Permit must authorize the relayer (it is msg.sender of transferFrom).
-      if (permit.spender && String(permit.spender).toLowerCase() !== relayer) {
-        return c.json({ error: 'permit.spender must be the relayer', relayer }, 400)
+      if (!bridgeWallet || !bridgeAddr) {
+        return c.json({ error: 'HL_SPOT_BRIDGE_PRIVATE_KEY not configured' }, 503)
       }
-      // The withdrawn-token amount the owner permits must cover the bridge fee.
-      let value: BigNumber
-      try {
-        value = BigNumber.from(permit.value)
-      } catch {
-        return c.json({ error: 'invalid permit.value' }, 400)
+      if (!ethers.utils.isAddress(destination)) {
+        return c.json({ error: 'invalid destination address' }, 400)
       }
-      const bridgeAmount = value.sub(cfg.bridgeFee)
-      if (bridgeAmount.lte(0)) {
-        return c.json({ error: `permit.value ${value.toString()} must exceed bridgeFee ${cfg.bridgeFee.toString()}` }, 400)
+      // SECURITY: the unshield MUST land at the bridge wallet. If extData.recipient
+      // were anything else, the funds wouldn't be here and the spotSend below would
+      // forward some OTHER user's transiting balance.
+      if (String(extData.recipient).toLowerCase() !== bridgeAddr) {
+        return c.json({ error: 'extData.recipient must be the HL_SPOT_BRIDGE wallet', bridge: bridgeAddr }, 400)
       }
-      // An in-note fee (paid to the relayer in-token) is optional here — the
-      // relayer is normally paid via bridgeFee — but if one is set it must be ours.
+      // Optional in-note fee (paid to the relayer in-token) — if set, must be ours.
       const hasNoteFee = (() => {
         try {
           return BigNumber.from(extData.fee ?? 0).gt(0)
@@ -412,7 +502,7 @@ export function mountRelay(app: Hono): boolean {
       }
 
       const p = pools[key]
-      // (a) unshield: pool.transact lands the funds at extData.recipient (the owner).
+      // Simulate the unshield up front so a bad proof fails fast (no lock held).
       try {
         await simulate(p, 'transact', [proof, extData])
       } catch (e) {
@@ -421,43 +511,68 @@ export function mountRelay(app: Hono): boolean {
         console.error('[relay] /relay/withdrawToCore transact sim revert:', reason, '| pool:', key, '|', JSON.stringify(diag))
         return c.json({ error: 'simulation_reverted', reason, diag }, 400)
       }
-      const withdrawTx = await send(p, 'transact', [proof, extData])
-      await withdrawTx.wait(1)
 
-      // The pool's underlying ERC20 is what the owner now holds and what we bridge.
       const tokenAddr: string = await p.token()
-      const token = new ethers.Contract(tokenAddr, ERC20_PERMIT_ABI, wallet)
+      const token = new ethers.Contract(tokenAddr, ERC20_PERMIT_ABI, provider)
+      const core = await getCoreRead()
 
-      try {
-        // (b) permit: owner -> relayer allowance for `value`.
-        const permitTx = await send(token, 'permit', [
-          permit.owner,
-          relayer,
-          value,
-          permit.deadline,
-          permit.v,
-          permit.r,
-          permit.s,
-        ])
-        await permitTx.wait(1)
-
-        // (c) bridge: transferFrom(owner -> systemAddr(coreToken), value - bridgeFee).
-        const bridgeTx = await send(token, 'transferFrom', [permit.owner, systemAddr(coreToken), bridgeAmount])
-        await bridgeTx.wait(1)
-
-        // (d) relayer gas comp: transferFrom(owner -> relayer, bridgeFee).
-        if (cfg.bridgeFee.gt(0)) {
-          const feeTx = await send(token, 'transferFrom', [permit.owner, relayer, cfg.bridgeFee])
-          await feeTx.wait(1)
+      // Serialize the whole job so the EVM-received and Core-credited deltas are
+      // measured against a quiet bridge wallet (no concurrent job interleaving).
+      return await withJobLock(async () => {
+        // (a) unshield -> bridge wallet. Measure the ERC20 received.
+        const tokBefore: BigNumber = await token.balanceOf(bridgeAddr)
+        const withdrawTx = await send(p, 'transact', [proof, extData])
+        await withdrawTx.wait(1)
+        const tokAfter: BigNumber = await token.balanceOf(bridgeAddr)
+        const received = tokAfter.sub(tokBefore)
+        if (received.lte(0)) {
+          console.error('[relay] /relay/withdrawToCore: no ERC20 received at bridge after', withdrawTx.hash)
+          return c.json({ error: 'bridge_failed', reason: 'no funds received at bridge wallet', withdrawTxHash: withdrawTx.hash }, 500)
         }
 
-        return c.json({ withdrawTxHash: withdrawTx.hash, bridgeTxHash: bridgeTx.hash })
-      } catch (e) {
-        // The unshield already mined; surface that so the funds aren't presumed lost.
-        const reason = extractRevert(e)
-        console.error('[relay] /relay/withdrawToCore bridge leg failed after withdraw', withdrawTx.hash, ':', reason)
-        return c.json({ error: 'bridge_failed', reason, withdrawTxHash: withdrawTx.hash }, 500)
-      }
+        try {
+          // (b) bridge: transfer received -> systemAddr(coreToken). Snapshot the
+          // Core balance first so we can forward exactly what THIS bridge credits.
+          const coreBefore: BigNumber = await core.spotBalance(bridgeAddr, BigNumber.from(coreToken))
+          const xferData = token.interface.encodeFunctionData('transfer', [systemAddr(coreToken), received])
+          const bridgeTx = await bridgeSendTx(tokenAddr, xferData, gasBridgeTransfer)
+          await bridgeTx.wait(1)
+
+          // (c) wait for Core to credit, then spotSend the delta to destination.
+          let credited = BigNumber.from(0)
+          for (let i = 0; i < bridgePollTries; i++) {
+            await sleep(bridgePollMs)
+            const now: BigNumber = await core.spotBalance(bridgeAddr, BigNumber.from(coreToken))
+            if (now.gt(coreBefore)) {
+              credited = now.sub(coreBefore)
+              break
+            }
+          }
+          if (credited.lte(0)) {
+            console.error('[relay] /relay/withdrawToCore: Core never credited after bridge', bridgeTx.hash)
+            return c.json({ error: 'bridge_pending', reason: 'Core balance not credited in time', withdrawTxHash: withdrawTx.hash, bridgeTxHash: bridgeTx.hash }, 504)
+          }
+
+          const action = encodeSpotSend(destination, coreToken, credited)
+          const sendData = new ethers.utils.Interface(CORE_WRITER_ABI).encodeFunctionData('sendRawAction', [action])
+          const spotTx = await bridgeSendTx(CORE_WRITER, sendData, gasBridgeSpotSend)
+          await spotTx.wait(1)
+
+          return c.json({
+            withdrawTxHash: withdrawTx.hash,
+            bridgeTxHash: bridgeTx.hash,
+            spotSendTxHash: spotTx.hash,
+            destination,
+            amount: credited.toString(),
+          })
+        } catch (e) {
+          // Unshield already mined; funds sit at the bridge wallet (recoverable),
+          // not lost to a wrong party. Surface the tx so it can be reconciled.
+          const reason = extractRevert(e)
+          console.error('[relay] /relay/withdrawToCore bridge/spotSend leg failed after', withdrawTx.hash, ':', reason)
+          return c.json({ error: 'bridge_failed', reason, withdrawTxHash: withdrawTx.hash }, 500)
+        }
+      })
     } catch (e) {
       return c.json({ error: 'relay_failed', reason: extractRevert(e) }, 500)
     }
