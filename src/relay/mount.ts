@@ -22,6 +22,8 @@ import {
   setSpotBridged,
   setSpotDone,
   openSpotWithdraws,
+  getSpotWithdraw,
+  bumpSpotAttempt,
 } from './store'
 import { isHumanOrder, buildTradeParams, randomCloid } from './order'
 
@@ -181,6 +183,7 @@ export function mountRelay(app: Hono): boolean {
   const gasBridgeSpotSend = envInt('GAS_BRIDGE_SPOTSEND', 2_000_000)
   const bridgePollMs = envInt('BRIDGE_CREDIT_POLL_MS', 3000)
   const bridgePollTries = envInt('BRIDGE_CREDIT_POLL_TRIES', 25)
+  const spotMaxAttempts = envInt('SPOT_MAX_ATTEMPTS', 10)
 
   // Independent nonce lock for the bridge wallet's own EVM txs (it's a separate
   // signer from the main relayer, so it needs its own serialized nonce).
@@ -259,6 +262,14 @@ export function mountRelay(app: Hono): boolean {
       const bal: BigNumber = await token.balanceOf(bridgeAddr!)
       const amt = BigNumber.from(job.evmReceived)
       if (bal.gte(amt)) {
+        // Pre-simulate so a permanently-reverting transfer (e.g. the token
+        // blacklists the HyperCore system address) fails WITHOUT sending a tx —
+        // otherwise every retry burns gas on a reverted tx.
+        try {
+          await token.callStatic.transfer(systemAddr(job.coreToken), amt, { from: bridgeAddr! })
+        } catch (e) {
+          throw new Error('bridge transfer would revert: ' + extractRevert(e))
+        }
         const data = token.interface.encodeFunctionData('transfer', [systemAddr(job.coreToken), amt])
         const tx = await bridgeSendTx(job.token, data, gasBridgeTransfer)
         await tx.wait(1)
@@ -645,6 +656,27 @@ export function mountRelay(app: Hono): boolean {
     }
   })
 
+  // Poll a spot-withdraw job (the front uses this after a 202 pending response).
+  app.get('/relay/withdrawToCore/:id', async (c) => {
+    try {
+      const row = await getSpotWithdraw(c.req.param('id'))
+      if (!row) return c.json({ error: 'not found' }, 404)
+      return c.json({
+        id: row.id,
+        status: row.status, // unshielded | bridged | done | failed
+        destination: row.destination,
+        amount: row.evm_received,
+        withdrawTxHash: row.withdraw_tx,
+        bridgeTxHash: row.bridge_tx,
+        spotSendTxHash: row.spotsend_tx,
+        attempts: row.attempts,
+        lastError: row.last_error,
+      })
+    } catch (e) {
+      return c.json({ error: 'lookup_failed', reason: extractRevert(e) }, 500)
+    }
+  })
+
   // ---------------------------------------------------------------- delivery worker
   let core: ethers.Contract | null = null
   const inFlight = new Set<string>()
@@ -722,12 +754,17 @@ export function mountRelay(app: Hono): boolean {
             destination: j.destination,
             evmReceived: j.evm_received,
             coreBefore: j.core_before,
-            status: j.status,
+            status: j.status as SpotJob['status'],
             bridgeTx: j.bridge_tx,
           })
           console.log(`[relay] resumed spot withdraw ${j.id} -> ${j.destination} (${r.amount}) spotSend ${r.spotSendTxHash}`)
         } catch (e) {
-          console.error(`[relay] spot resume ${j.id} pending:`, extractRevert(e))
+          const reason = extractRevert(e)
+          // Count the attempt; park as 'failed' after the cap so we stop retrying
+          // (and stop burning gas / spamming) on a permanently-stuck job.
+          await bumpSpotAttempt(j.id, reason, spotMaxAttempts).catch(() => {})
+          const parked = Number(j.attempts) + 1 >= spotMaxAttempts
+          console.error(`[relay] spot resume ${j.id} ${parked ? 'PARKED (failed)' : 'pending'}:`, reason)
         }
       }
     })

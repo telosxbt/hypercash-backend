@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS spot_withdraws (
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS spot_withdraws_open ON spot_withdraws (bridge, status);
+ALTER TABLE spot_withdraws ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE spot_withdraws ADD COLUMN IF NOT EXISTS last_error TEXT;
 `
 
 export interface SpotWithdraw {
@@ -49,7 +51,9 @@ export interface SpotWithdraw {
   withdraw_tx: string | null
   bridge_tx: string | null
   spotsend_tx: string | null
-  status: 'unshielded' | 'bridged' | 'done'
+  status: 'unshielded' | 'bridged' | 'done' | 'failed'
+  attempts: number
+  last_error: string | null
 }
 
 export async function createSpotWithdraw(row: {
@@ -78,12 +82,29 @@ export async function setSpotDone(id: string, spotSendTx: string): Promise<void>
   await sql`UPDATE spot_withdraws SET status='done', spotsend_tx=${spotSendTx}, updated_at=now() WHERE id=${id}`
 }
 
-// Open (unfinished) jobs for a bridge wallet, oldest first — the resume worker
-// finishes these in order so the per-job Core delta stays clean.
+// Open (unfinished, not parked) jobs for a bridge wallet, oldest first — the
+// resume worker finishes these in order so the per-job Core delta stays clean.
 export async function openSpotWithdraws(bridge: string): Promise<SpotWithdraw[]> {
   return sql<SpotWithdraw[]>`
-    SELECT * FROM spot_withdraws WHERE bridge=${bridge} AND status <> 'done'
+    SELECT * FROM spot_withdraws WHERE bridge=${bridge} AND status NOT IN ('done','failed')
     ORDER BY id ASC`
+}
+
+export async function getSpotWithdraw(id: string): Promise<SpotWithdraw | null> {
+  const [r] = await sql<SpotWithdraw[]>`SELECT * FROM spot_withdraws WHERE id=${id}`
+  return r ?? null
+}
+
+// Record a failed attempt; park the job (status='failed') once it's clearly stuck
+// so the worker stops retrying (and stops burning gas on reverting txs).
+export async function bumpSpotAttempt(id: string, error: string, maxAttempts: number): Promise<void> {
+  await sql`
+    UPDATE spot_withdraws
+    SET attempts = attempts + 1,
+        last_error = ${error.slice(0, 400)},
+        status = CASE WHEN attempts + 1 >= ${maxAttempts} THEN 'failed' ELSE status END,
+        updated_at = now()
+    WHERE id = ${id}`
 }
 
 export async function initRelayStore(): Promise<void> {
