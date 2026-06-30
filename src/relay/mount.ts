@@ -13,7 +13,16 @@ import type { Hono } from 'hono'
 import { ethers, BigNumber } from 'ethers'
 import { TRADER_ABI, CORE_ABI, POOL_ABI, ERC20_PERMIT_ABI, CORE_WRITER, CORE_WRITER_ABI, STATUS } from './abis'
 import { checkFee } from './validate'
-import { initRelayStore, recordTrade, openTradeIds, markDone } from './store'
+import {
+  initRelayStore,
+  recordTrade,
+  openTradeIds,
+  markDone,
+  createSpotWithdraw,
+  setSpotBridged,
+  setSpotDone,
+  openSpotWithdraws,
+} from './store'
 import { isHumanOrder, buildTradeParams, randomCloid } from './order'
 
 interface RelayConfig {
@@ -222,6 +231,61 @@ export function mountRelay(app: Hono): boolean {
     return coreRead
   }
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  // Finish a spot-withdraw job's on-chain legs idempotently from its journal
+  // state: (bridge if not yet bridged) → wait for Core credit → spotSend the
+  // exact credited delta to the destination. Used by the route AND the resume
+  // worker, so a job interrupted mid-flight is completed to the user's address
+  // automatically — no manual recovery. MUST be called holding withJobLock.
+  type SpotJob = {
+    id: string
+    token: string
+    coreToken: ethers.BigNumberish
+    destination: string
+    evmReceived: string
+    coreBefore: string
+    status: 'unshielded' | 'bridged' | 'done'
+    bridgeTx: string | null
+  }
+  async function runSpotLegs(job: SpotJob): Promise<{ bridgeTxHash: string | null; spotSendTxHash: string; amount: string }> {
+    const token = new ethers.Contract(job.token, ERC20_PERMIT_ABI, provider)
+    const core = await getCoreRead()
+    const coreBefore = BigNumber.from(job.coreBefore)
+    let bridgeTxHash = job.bridgeTx
+
+    if (job.status === 'unshielded') {
+      // If the ERC20 is still here, bridge it. If it already left (a pre-crash
+      // bridge tx that wasn't journaled), skip straight to the credit/spotSend.
+      const bal: BigNumber = await token.balanceOf(bridgeAddr!)
+      const amt = BigNumber.from(job.evmReceived)
+      if (bal.gte(amt)) {
+        const data = token.interface.encodeFunctionData('transfer', [systemAddr(job.coreToken), amt])
+        const tx = await bridgeSendTx(job.token, data, gasBridgeTransfer)
+        await tx.wait(1)
+        bridgeTxHash = tx.hash
+      }
+      await setSpotBridged(job.id, bridgeTxHash ?? 'recovered')
+    }
+
+    // Wait for HyperCore to credit the bridge wallet, then forward the delta.
+    let credited = BigNumber.from(0)
+    for (let i = 0; i < bridgePollTries; i++) {
+      await sleep(bridgePollMs)
+      const now: BigNumber = await core.spotBalance(bridgeAddr!, BigNumber.from(job.coreToken))
+      if (now.gt(coreBefore)) {
+        credited = now.sub(coreBefore)
+        break
+      }
+    }
+    if (credited.lte(0)) throw new Error('Core balance not credited in time')
+
+    const action = encodeSpotSend(job.destination, job.coreToken, credited)
+    const sendData = new ethers.utils.Interface(CORE_WRITER_ABI).encodeFunctionData('sendRawAction', [action])
+    const spotTx = await bridgeSendTx(CORE_WRITER, sendData, gasBridgeSpotSend)
+    await spotTx.wait(1)
+    await setSpotDone(job.id, spotTx.hash)
+    return { bridgeTxHash, spotSendTxHash: spotTx.hash, amount: credited.toString() }
+  }
 
   // On a trade() bare revert, localize the failure. trade() is a thin wrapper:
   // validate params -> usdcPool.transact(proof,extData) (the ZK spend) -> bridge
@@ -521,6 +585,7 @@ export function mountRelay(app: Hono): boolean {
       return await withJobLock(async () => {
         // (a) unshield -> bridge wallet. Measure the ERC20 received.
         const tokBefore: BigNumber = await token.balanceOf(bridgeAddr)
+        const coreBefore: BigNumber = await core.spotBalance(bridgeAddr, BigNumber.from(coreToken))
         const withdrawTx = await send(p, 'transact', [proof, extData])
         await withdrawTx.wait(1)
         const tokAfter: BigNumber = await token.balanceOf(bridgeAddr)
@@ -530,47 +595,37 @@ export function mountRelay(app: Hono): boolean {
           return c.json({ error: 'bridge_failed', reason: 'no funds received at bridge wallet', withdrawTxHash: withdrawTx.hash }, 500)
         }
 
+        // Journal the job BEFORE the bridge/spotSend legs so a crash leaves a
+        // resumable record (destination + amounts) the worker can finish.
+        const jobId = await createSpotWithdraw({
+          bridge: bridgeAddr,
+          pool: key,
+          token: tokenAddr,
+          coreToken: BigNumber.from(coreToken).toString(),
+          destination,
+          evmReceived: received.toString(),
+          coreBefore: coreBefore.toString(),
+          withdrawTx: withdrawTx.hash,
+        })
+
         try {
-          // (b) bridge: transfer received -> systemAddr(coreToken). Snapshot the
-          // Core balance first so we can forward exactly what THIS bridge credits.
-          const coreBefore: BigNumber = await core.spotBalance(bridgeAddr, BigNumber.from(coreToken))
-          const xferData = token.interface.encodeFunctionData('transfer', [systemAddr(coreToken), received])
-          const bridgeTx = await bridgeSendTx(tokenAddr, xferData, gasBridgeTransfer)
-          await bridgeTx.wait(1)
-
-          // (c) wait for Core to credit, then spotSend the delta to destination.
-          let credited = BigNumber.from(0)
-          for (let i = 0; i < bridgePollTries; i++) {
-            await sleep(bridgePollMs)
-            const now: BigNumber = await core.spotBalance(bridgeAddr, BigNumber.from(coreToken))
-            if (now.gt(coreBefore)) {
-              credited = now.sub(coreBefore)
-              break
-            }
-          }
-          if (credited.lte(0)) {
-            console.error('[relay] /relay/withdrawToCore: Core never credited after bridge', bridgeTx.hash)
-            return c.json({ error: 'bridge_pending', reason: 'Core balance not credited in time', withdrawTxHash: withdrawTx.hash, bridgeTxHash: bridgeTx.hash }, 504)
-          }
-
-          const action = encodeSpotSend(destination, coreToken, credited)
-          const sendData = new ethers.utils.Interface(CORE_WRITER_ABI).encodeFunctionData('sendRawAction', [action])
-          const spotTx = await bridgeSendTx(CORE_WRITER, sendData, gasBridgeSpotSend)
-          await spotTx.wait(1)
-
-          return c.json({
-            withdrawTxHash: withdrawTx.hash,
-            bridgeTxHash: bridgeTx.hash,
-            spotSendTxHash: spotTx.hash,
+          const r = await runSpotLegs({
+            id: jobId,
+            token: tokenAddr,
+            coreToken,
             destination,
-            amount: credited.toString(),
+            evmReceived: received.toString(),
+            coreBefore: coreBefore.toString(),
+            status: 'unshielded',
+            bridgeTx: null,
           })
+          return c.json({ withdrawTxHash: withdrawTx.hash, ...r, destination })
         } catch (e) {
-          // Unshield already mined; funds sit at the bridge wallet (recoverable),
-          // not lost to a wrong party. Surface the tx so it can be reconciled.
+          // Funds are safely at the bridge wallet and the job is journaled — the
+          // resume worker will finish it to `destination`. Not lost, not manual.
           const reason = extractRevert(e)
-          console.error('[relay] /relay/withdrawToCore bridge/spotSend leg failed after', withdrawTx.hash, ':', reason)
-          return c.json({ error: 'bridge_failed', reason, withdrawTxHash: withdrawTx.hash }, 500)
+          console.error('[relay] /relay/withdrawToCore legs pending (will resume) job', jobId, ':', reason)
+          return c.json({ status: 'pending', reason, withdrawTxHash: withdrawTx.hash, jobId, destination }, 202)
         }
       })
     } catch (e) {
@@ -632,10 +687,48 @@ export function mountRelay(app: Hono): boolean {
     }
   }
 
+  // Resume any spot-withdraw whose bridge/spotSend legs didn't finish (crash,
+  // RPC hiccup, Core credit lag). Runs under withJobLock and re-reads the open
+  // set INSIDE the lock, so it never races a live /relay/withdrawToCore request
+  // nor double-sends. Each job is finished to its journaled destination.
+  const spotResumeTick = async (): Promise<void> => {
+    if (!bridgeAddr) return
+    await withJobLock(async () => {
+      let jobs
+      try {
+        jobs = await openSpotWithdraws(bridgeAddr)
+      } catch (e) {
+        console.error('[relay] spot resume: list failed:', extractRevert(e))
+        return
+      }
+      for (const j of jobs) {
+        try {
+          const r = await runSpotLegs({
+            id: j.id,
+            token: j.token,
+            coreToken: j.core_token,
+            destination: j.destination,
+            evmReceived: j.evm_received,
+            coreBefore: j.core_before,
+            status: j.status,
+            bridgeTx: j.bridge_tx,
+          })
+          console.log(`[relay] resumed spot withdraw ${j.id} -> ${j.destination} (${r.amount}) spotSend ${r.spotSendTxHash}`)
+        } catch (e) {
+          console.error(`[relay] spot resume ${j.id} pending:`, extractRevert(e))
+        }
+      }
+    })
+  }
+
   initRelayStore()
     .then(() => {
       setInterval(workerTick, cfg.pollMs)
-      console.log(`Relayer enabled — signer ${relayer}, trader ${cfg.trader}, delivery worker every ${cfg.pollMs}ms`)
+      if (bridgeWallet) setInterval(spotResumeTick, cfg.pollMs)
+      console.log(
+        `Relayer enabled — signer ${relayer}, trader ${cfg.trader}, delivery worker every ${cfg.pollMs}ms` +
+          (bridgeWallet ? `, spot bridge ${bridgeAddr} (resume worker on)` : ''),
+      )
     })
     .catch((e) => console.error('[relay] store init failed:', extractRevert(e)))
 

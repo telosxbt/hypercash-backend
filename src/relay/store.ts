@@ -14,7 +14,77 @@ CREATE TABLE IF NOT EXISTS relay_trades (
   PRIMARY KEY (trader, trade_id)
 );
 CREATE INDEX IF NOT EXISTS relay_trades_open ON relay_trades (trader, status);
+
+-- Journal for /relay/withdrawToCore so a job that dies mid-flight (after the
+-- unshield landed funds at the bridge wallet) can be resumed and delivered to
+-- the recorded destination — the user never has to recover funds manually.
+CREATE TABLE IF NOT EXISTS spot_withdraws (
+  id           BIGSERIAL PRIMARY KEY,
+  bridge       TEXT   NOT NULL,           -- the HL_SPOT_BRIDGE wallet
+  pool         TEXT   NOT NULL,
+  token        TEXT   NOT NULL,           -- underlying ERC20
+  core_token   BIGINT NOT NULL,
+  destination  TEXT   NOT NULL,
+  evm_received TEXT   NOT NULL,           -- amount unshielded to the bridge (wei)
+  core_before  TEXT   NOT NULL,           -- bridge Core spot balance before bridging
+  withdraw_tx  TEXT,
+  bridge_tx    TEXT,
+  spotsend_tx  TEXT,
+  status       TEXT   NOT NULL DEFAULT 'unshielded',  -- unshielded|bridged|done
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS spot_withdraws_open ON spot_withdraws (bridge, status);
 `
+
+export interface SpotWithdraw {
+  id: string
+  bridge: string
+  pool: string
+  token: string
+  core_token: string
+  destination: string
+  evm_received: string
+  core_before: string
+  withdraw_tx: string | null
+  bridge_tx: string | null
+  spotsend_tx: string | null
+  status: 'unshielded' | 'bridged' | 'done'
+}
+
+export async function createSpotWithdraw(row: {
+  bridge: string
+  pool: string
+  token: string
+  coreToken: string
+  destination: string
+  evmReceived: string
+  coreBefore: string
+  withdrawTx: string
+}): Promise<string> {
+  const [r] = await sql<{ id: string }[]>`
+    INSERT INTO spot_withdraws (bridge, pool, token, core_token, destination, evm_received, core_before, withdraw_tx)
+    VALUES (${row.bridge}, ${row.pool}, ${row.token}, ${row.coreToken}, ${row.destination},
+            ${row.evmReceived}, ${row.coreBefore}, ${row.withdrawTx})
+    RETURNING id`
+  return r.id
+}
+
+export async function setSpotBridged(id: string, bridgeTx: string): Promise<void> {
+  await sql`UPDATE spot_withdraws SET status='bridged', bridge_tx=${bridgeTx}, updated_at=now() WHERE id=${id}`
+}
+
+export async function setSpotDone(id: string, spotSendTx: string): Promise<void> {
+  await sql`UPDATE spot_withdraws SET status='done', spotsend_tx=${spotSendTx}, updated_at=now() WHERE id=${id}`
+}
+
+// Open (unfinished) jobs for a bridge wallet, oldest first — the resume worker
+// finishes these in order so the per-job Core delta stays clean.
+export async function openSpotWithdraws(bridge: string): Promise<SpotWithdraw[]> {
+  return sql<SpotWithdraw[]>`
+    SELECT * FROM spot_withdraws WHERE bridge=${bridge} AND status <> 'done'
+    ORDER BY id ASC`
+}
 
 export async function initRelayStore(): Promise<void> {
   await sql.unsafe(DDL)
