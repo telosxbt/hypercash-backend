@@ -183,7 +183,8 @@ export function mountRelay(app: Hono): boolean {
   const gasBridgeSpotSend = envInt('GAS_BRIDGE_SPOTSEND', 2_000_000)
   const bridgePollMs = envInt('BRIDGE_CREDIT_POLL_MS', 3000)
   const bridgePollTries = envInt('BRIDGE_CREDIT_POLL_TRIES', 25)
-  const spotMaxAttempts = envInt('SPOT_MAX_ATTEMPTS', 10)
+  const spotMaxAttempts = envInt('SPOT_MAX_ATTEMPTS', 3)
+  const spotResumeMs = envInt('SPOT_RESUME_MS', 30_000)
 
   // Independent nonce lock for the bridge wallet's own EVM txs (it's a separate
   // signer from the main relayer, so it needs its own serialized nonce).
@@ -773,10 +774,10 @@ export function mountRelay(app: Hono): boolean {
   initRelayStore()
     .then(() => {
       setInterval(workerTick, cfg.pollMs)
-      if (bridgeWallet) setInterval(spotResumeTick, cfg.pollMs)
+      if (bridgeWallet) setInterval(spotResumeTick, spotResumeMs)
       console.log(
         `Relayer enabled — signer ${relayer}, trader ${cfg.trader}, delivery worker every ${cfg.pollMs}ms` +
-          (bridgeWallet ? `, spot bridge ${bridgeAddr} (resume worker on)` : ''),
+          (bridgeWallet ? `, spot bridge ${bridgeAddr} (resume every ${spotResumeMs}ms, max ${spotMaxAttempts} tries)` : ''),
       )
     })
     .catch((e) => console.error('[relay] store init failed:', extractRevert(e)))
