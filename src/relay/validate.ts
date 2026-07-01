@@ -18,6 +18,16 @@ export interface FeeCheck {
  */
 export function checkFee(ext: ExtDataLike | undefined, relayer: string, minFee: BigNumber): FeeCheck {
   if (!ext) return { ok: false, error: 'missing extData' }
+  // The deployed pool enforces its own protocol fee (feeBps → protocolFeeRecipient);
+  // when no relayer fee is required (minFee 0) and the note carries no fee, there's
+  // nothing to validate here — let the pool's on-chain check govern the fee.
+  let feeVal: BigNumber
+  try {
+    feeVal = BigNumber.from(ext.fee ?? 0)
+  } catch {
+    return { ok: false, error: 'invalid fee' }
+  }
+  if (minFee.lte(0) && feeVal.isZero()) return { ok: true }
   const recipient = String(ext.feeRecipient ?? '').toLowerCase()
   if (!recipient || recipient !== relayer.toLowerCase()) {
     return { ok: false, error: 'feeRecipient is not the relayer' }
