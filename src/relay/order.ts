@@ -4,14 +4,16 @@
 // asset + formats sizes (its own design choice, #596).
 import { ethers, BigNumber } from 'ethers'
 
-// HL testnet spot mapping for the v1 buy assets (from spotMeta):
-//   asset          = order asset id (10000 + spot universe index)
+// HL MAINNET spot mapping for the v1 buy assets (from spotMeta, chain 999):
+//   asset          = order asset id (10000 + spot universe index of the X/USDC pair)
 //   assetCoreToken = HyperCore spot token index (for spotBalance/delivery)
 //   szDecimals     = size decimals
+// NB: these are MAINNET ids — testnet used entirely different ones (ETH 11137/1242,
+// BTC 11054/1129, HYPE 11035/1105), which made trade() early-revert on mainnet.
 export const COIN_MAP: Record<string, { asset: number; assetCoreToken: number; szDecimals: number }> = {
-  ETH: { asset: 11137, assetCoreToken: 1242, szDecimals: 4 }, // UETH
-  BTC: { asset: 11054, assetCoreToken: 1129, szDecimals: 5 }, // UNIT
-  HYPE: { asset: 11035, assetCoreToken: 1105, szDecimals: 2 },
+  ETH: { asset: 10151, assetCoreToken: 221, szDecimals: 4 }, // UETH/USDC (@151)
+  BTC: { asset: 10142, assetCoreToken: 197, szDecimals: 5 }, // UBTC/USDC (@142)
+  HYPE: { asset: 10107, assetCoreToken: 150, szDecimals: 2 }, // HYPE/USDC (@107)
 }
 
 // HyperCore spot price integer = price * 10^(8 - szDecimals)  (spot MAX_DECIMALS = 8).

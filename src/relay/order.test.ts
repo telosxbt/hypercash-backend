@@ -16,8 +16,8 @@ test('ETH order → on-chain TradeParams (the case that crashed)', () => {
     { coin: 'ETH', recipient: REC, size: '0.0062', limitPx: '1630', venue: 1, deadline: '0' },
     CLOID,
   )
-  expect(p.asset).toBe(11137)
-  expect(p.assetCoreToken).toBe(1242)
+  expect(p.asset).toBe(10151)
+  expect(p.assetCoreToken).toBe(221)
   expect(p.size.toString()).toBe('62') // 0.0062 * 1e4
   expect(p.limitPx.toString()).toBe('16300000') // 1630 * 1e(8-4)
   expect(p.recipient).toBe(REC)
@@ -27,10 +27,10 @@ test('ETH order → on-chain TradeParams (the case that crashed)', () => {
 })
 
 test('BTC + HYPE map to the right asset ids', () => {
-  expect(COIN_MAP.BTC.asset).toBe(11054)
-  expect(COIN_MAP.HYPE.asset).toBe(11035)
+  expect(COIN_MAP.BTC.asset).toBe(10142)
+  expect(COIN_MAP.HYPE.asset).toBe(10107)
   const b = buildTradeParams({ coin: 'btc', recipient: REC, size: '0.1', limitPx: '60000' }, CLOID)
-  expect(b.assetCoreToken).toBe(1129)
+  expect(b.assetCoreToken).toBe(197)
   expect(b.size.toString()).toBe('10000') // 0.1 * 1e5
 })
 
