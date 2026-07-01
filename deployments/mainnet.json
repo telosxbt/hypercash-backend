@@ -1,19 +1,21 @@
 {
   "network": "hyperevm",
   "chainId": 999,
-  "note": "HyperCash v1 MAINNET deployment (2026-06-30). Reference only — the live service is configured via Railway env vars (POOLS, RPC_URL, CHAIN_ID, TRADER_ADDRESS, USDC_POOL_ADDRESS, HYPE_POOL_ADDRESS, HL_SPOT_BRIDGE_PRIVATE_KEY). Real HL-linked tokens (no blacklist on the bridge system address).",
+  "note": "HyperCash v1 MAINNET (2026-07-01, real USDC). Live service configured via Railway env (POOLS, RPC_URL, CHAIN_ID, TRADER_ADDRESS, USDC_POOL_ADDRESS, HYPE_POOL_ADDRESS, CORE_GATEWAY, HL_SPOT_BRIDGE_PRIVATE_KEY). USDC bridges to Core via the CoreDepositWallet (approve + deposit), not the 0x2000 system address.",
   "deployer": "0xa5a1ADa700056064c59C604083d44B510e37d413",
   "rpcUrl": "https://rpc.hyperliquid.xyz/evm",
-  "deployBlock": 39240000,
-  "verifier2": "0xeAdF9b5FF35A761aEc572A90420CA957b9FF2695",
-  "hasher": "0xe3ef56E4DDe628FC66c0b9c3FF6b3198234600F8",
-  "trader": "0x8bF785da2cC8faf77b787d7FE854C4E27393EDE__TRUNCATED__NEEDS_FULL_ADDRESS",
+  "deployBlock": 39257000,
+  "verifier2": "0xAD1325156648e4238C36cFF58FE6A43ba95A7585",
+  "hasher": "0x62b14987d24A25Ea85E2992e2D97901EFF7B4f36",
+  "trader": "0xeCffdF85113a02b8cD4c81ddD777E6A78C1E420d",
+  "core": "0x94E53f5BEAfB201Ed71483A46fF73C33E47C9E8C",
   "coreWriter": "0x3333333333333333333333333333333333333333",
-  "tradeAccountImpl": "0x57Ba07b1f037Ba80aaf715A37abDB3Ae6B625fd7",
+  "coreDepositWallet": "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24",
+  "tradeAccountImpl": "0x3F252f95095BcDaaF1390B59567Bd14DB2336aaA",
   "pools": {
-    "usdc": { "pool": "0xd4ae724B61d6a21B6E649124349e1A94E3911285", "token": "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24", "decimals": 6, "coreToken": 0 },
-    "btc":  { "pool": "0x50E8BFb6Ae4941FcF64B57B0ed02665EF235349B", "token": "0x9fdbda0a5e284c32744d2f17ee5c74b284993463", "decimals": 8, "coreToken": 197 },
-    "eth":  { "pool": "0x29Bdc9A8De2421c0bE0c5d6ED7167Ae5Bd9Db6Ee", "token": "0xbe6727b535545c67d5caa73dea54865b92cf7907", "decimals": 18, "coreToken": 221 },
-    "hype": { "pool": "0x1D25466dc6c880F4D3855B3629A442EfE2AfEc31", "decimals": 18, "coreToken": 150 }
+    "usdc": { "pool": "0x50e63C9C5D6623e4997622F5fF07277f0916b412", "token": "0xb88339CB7199b77E23DB6E890353E22632Ba630f", "decimals": 6, "coreToken": 0 },
+    "btc":  { "pool": "0xD6159345E1A478C361E62198604650f02c297120", "token": "0x9fdbda0a5e284c32744d2f17ee5c74b284993463", "decimals": 8, "coreToken": 197 },
+    "eth":  { "pool": "0x5CE6f4C7D6435Bc09182AdbF42B30c4AB95D26BB", "token": "0xbe6727b535545c67d5caa73dea54865b92cf7907", "decimals": 18, "coreToken": 221 },
+    "hype": { "pool": "0xfC7417d56f7869Ede018BEb8B3C2ED6Bc2f643e6", "decimals": 18, "coreToken": 150 }
   }
 }
