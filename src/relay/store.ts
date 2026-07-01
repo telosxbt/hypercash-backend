@@ -97,14 +97,24 @@ export async function getSpotWithdraw(id: string): Promise<SpotWithdraw | null> 
 
 // Record a failed attempt; park the job (status='failed') once it's clearly stuck
 // so the worker stops retrying (and stops burning gas on reverting txs).
+// Only jobs still at the 'unshielded' stage (deposit not yet done) get parked
+// after maxAttempts. Once a job is 'bridged' (deposit succeeded → funds are
+// safely on the bridge, just waiting for HyperCore's escrow to finalize into the
+// spendable spot balance, which can take minutes), we NEVER park it — the worker
+// keeps retrying the spotSend until it lands, so funds are never stranded.
 export async function bumpSpotAttempt(id: string, error: string, maxAttempts: number): Promise<void> {
   await sql`
     UPDATE spot_withdraws
     SET attempts = attempts + 1,
         last_error = ${error.slice(0, 400)},
-        status = CASE WHEN attempts + 1 >= ${maxAttempts} THEN 'failed' ELSE status END,
+        status = CASE WHEN attempts + 1 >= ${maxAttempts} AND status = 'unshielded' THEN 'failed' ELSE status END,
         updated_at = now()
     WHERE id = ${id}`
+}
+
+// Re-open a parked/failed job (admin recovery) so the worker retries it.
+export async function reopenSpotWithdraw(id: string, status: 'unshielded' | 'bridged'): Promise<void> {
+  await sql`UPDATE spot_withdraws SET status=${status}, attempts=0, last_error=null, updated_at=now() WHERE id=${id}`
 }
 
 export async function initRelayStore(): Promise<void> {

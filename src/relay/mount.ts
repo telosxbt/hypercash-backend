@@ -192,6 +192,31 @@ export function mountRelay(app: Hono): boolean {
     process.env.CORE_DEPOSIT_WALLET?.toLowerCase() ||
     (cfg.chainId === 999 ? '0x6b9e773128f453f5c2c60935ee2de2cbc5390a24' : '')
 
+  // Core spot weiDecimals per coreToken, to scale the EVM amount to the Core
+  // spotSend amount. Mainnet defaults (USDC 8, HYPE 8, UBTC 10, UETH 9); override
+  // via CORE_DECIMALS env (JSON {"<coreToken>": <dec>}).
+  const coreDecimalsMap: Record<string, number> = (() => {
+    const base: Record<string, number> = { '0': 8, '150': 8, '197': 10, '221': 9 }
+    try {
+      return { ...base, ...(process.env.CORE_DECIMALS ? JSON.parse(process.env.CORE_DECIMALS) : {}) }
+    } catch {
+      return base
+    }
+  })()
+  const evmDecCache: Record<string, number> = {}
+  const evmDecimalsOf = async (tokenAddr: string): Promise<number> => {
+    const k = tokenAddr.toLowerCase()
+    if (evmDecCache[k] !== undefined) return evmDecCache[k]
+    const c = new ethers.Contract(tokenAddr, ['function decimals() view returns (uint8)'], provider)
+    const d = Number(await c.decimals())
+    evmDecCache[k] = d
+    return d
+  }
+  const toCoreAmount = (evmAmount: BigNumber, evmDec: number, coreDec: number): BigNumber => {
+    const diff = coreDec - evmDec
+    return diff >= 0 ? evmAmount.mul(BigNumber.from(10).pow(diff)) : evmAmount.div(BigNumber.from(10).pow(-diff))
+  }
+
   // Independent nonce lock for the bridge wallet's own EVM txs (it's a separate
   // signer from the main relayer, so it needs its own serialized nonce).
   let bridgeLock: Promise<void> = Promise.resolve()
@@ -260,7 +285,6 @@ export function mountRelay(app: Hono): boolean {
   async function runSpotLegs(job: SpotJob): Promise<{ bridgeTxHash: string | null; spotSendTxHash: string; amount: string }> {
     const token = new ethers.Contract(job.token, ERC20_PERMIT_ABI, provider)
     const core = await getCoreRead()
-    const coreBefore = BigNumber.from(job.coreBefore)
     let bridgeTxHash = job.bridgeTx
 
     if (job.status === 'unshielded') {
@@ -306,17 +330,24 @@ export function mountRelay(app: Hono): boolean {
       await setSpotBridged(job.id, bridgeTxHash ?? 'recovered')
     }
 
-    // Wait for HyperCore to credit the bridge wallet, then forward the delta.
+    // Forward the EXACT expected amount for THIS job (scaled to Core weiDecimals),
+    // gated on the bridge's spot balance reaching it. Using an absolute expected
+    // amount (not a balance delta) means a job can never grab another job's funds,
+    // and it tolerates HyperCore's escrow finalization delay (deposits sit in
+    // evmEscrow for minutes before crediting the spendable spot balance).
+    const coreDec = coreDecimalsMap[BigNumber.from(job.coreToken).toString()] ?? 8
+    const evmDec = await evmDecimalsOf(job.token)
+    const expected = toCoreAmount(BigNumber.from(job.evmReceived), evmDec, coreDec)
     let credited = BigNumber.from(0)
     for (let i = 0; i < bridgePollTries; i++) {
       await sleep(bridgePollMs)
       const now: BigNumber = await core.spotBalance(bridgeAddr!, BigNumber.from(job.coreToken))
-      if (now.gt(coreBefore)) {
-        credited = now.sub(coreBefore)
+      if (now.gte(expected)) {
+        credited = expected
         break
       }
     }
-    if (credited.lte(0)) throw new Error('Core balance not credited in time')
+    if (credited.lte(0)) throw new Error('Core balance not credited in time (escrow finalizing)')
 
     const action = encodeSpotSend(job.destination, job.coreToken, credited)
     const sendData = new ethers.utils.Interface(CORE_WRITER_ABI).encodeFunctionData('sendRawAction', [action])
