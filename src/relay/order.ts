@@ -29,6 +29,7 @@ export interface HumanOrder {
   szDecimals?: number
 }
 
+// Matches the deployed HyperTrader.TradeParams exactly (7 fields, no venue).
 export interface TradeParams {
   asset: number
   assetCoreToken: number
@@ -36,7 +37,6 @@ export interface TradeParams {
   limitPx: BigNumber
   cloid: BigNumber
   recipient: string
-  venue: number
   deadline: BigNumber
 }
 
@@ -70,7 +70,6 @@ export function buildTradeParams(order: HumanOrder, cloid: BigNumber): TradePara
     limitPx,
     cloid,
     recipient: order.recipient,
-    venue: order.venue ?? 0,
     deadline: BigNumber.from(order.deadline ?? 0),
   }
 }

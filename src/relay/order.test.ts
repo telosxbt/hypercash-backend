@@ -21,7 +21,6 @@ test('ETH order → on-chain TradeParams (the case that crashed)', () => {
   expect(p.size.toString()).toBe('62') // 0.0062 * 1e4
   expect(p.limitPx.toString()).toBe('16300000') // 1630 * 1e(8-4)
   expect(p.recipient).toBe(REC)
-  expect(p.venue).toBe(1)
   expect(p.deadline.toString()).toBe('0')
   expect(p.cloid.toString()).toBe('123')
 })

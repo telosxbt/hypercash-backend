@@ -6,9 +6,11 @@ const PROOF =
   'tuple(uint256[2] pA,uint256[2][2] pB,uint256[2] pC,bytes32 root,bytes32[2] inputNullifiers,bytes32[2] outputCommitments,uint256 publicAmount,bytes32 extDataHash)'
 const EXTDATA =
   'tuple(address recipient,int256 extAmount,address feeRecipient,uint256 fee,bytes encryptedOutput1,bytes encryptedOutput2)'
-// TradeParams — field order MUST match the deployed struct (front sends `p` by name).
+// TradeParams — field order MUST match the DEPLOYED struct exactly. The deployed
+// HyperTrader.TradeParams has 7 fields and NO `venue`; encoding an extra field
+// mismatches the calldata layout and makes trade() bare-revert during ABI decode.
 const PARAMS =
-  'tuple(uint32 asset,uint64 assetCoreToken,uint64 size,uint64 limitPx,uint128 cloid,address recipient,uint8 venue,uint64 deadline)'
+  'tuple(uint32 asset,uint64 assetCoreToken,uint64 size,uint64 limitPx,uint128 cloid,address recipient,uint64 deadline)'
 
 export const TRADER_ABI = [
   // writes relayed by the relayer (it signs + pays HYPE gas)
@@ -16,15 +18,15 @@ export const TRADER_ABI = [
   'function deliver(uint256 tradeId)',
   'function cancel(uint256 tradeId)',
   // reads (deliver/cancel worker)
-  'function trades(uint256) view returns (address account,address recipient,uint64 assetCoreToken,uint64 size,uint8 venue,uint64 deadline,uint8 status)',
+  'function trades(uint256) view returns (address account,address recipient,uint64 assetCoreToken,uint64 size,uint64 deadline,uint8 status)',
   'function nextTradeId() view returns (uint256)',
   'function tradeAccountOf(uint256 tradeId) view returns (address)',
   'function core() view returns (address)',
   'function coreWriter() view returns (address)',
   'function usdcPool() view returns (address)',
-  // events
-  'event Traded(uint256 indexed tradeId,address account,address recipient,uint32 asset,uint64 assetCoreToken,uint64 size,uint64 limitPx,uint128 cloid,uint256 usdcIn,uint8 venue)',
-  'event Delivered(uint256 indexed tradeId,address recipient,uint64 assetCoreToken,uint64 size,uint8 venue)',
+  // events (must match the deployed contract exactly — no `venue`)
+  'event Traded(uint256 indexed tradeId,address account,address recipient,uint32 asset,uint64 assetCoreToken,uint64 size,uint64 limitPx,uint128 cloid,uint256 usdcIn)',
+  'event Delivered(uint256 indexed tradeId,address recipient,uint64 assetCoreToken,uint64 size)',
   'event Cancelled(uint256 indexed tradeId,address recipient,uint64 usdcRefunded,uint64 assetRefunded)',
 ]
 
