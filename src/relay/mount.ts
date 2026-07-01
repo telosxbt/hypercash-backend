@@ -11,7 +11,7 @@
 // recipient + venue are frozen on-chain at trade(): the relayer can't redirect.
 import type { Hono } from 'hono'
 import { ethers, BigNumber } from 'ethers'
-import { TRADER_ABI, CORE_ABI, POOL_ABI, ERC20_PERMIT_ABI, CORE_WRITER, CORE_WRITER_ABI, STATUS } from './abis'
+import { TRADER_ABI, CORE_ABI, POOL_ABI, ERC20_PERMIT_ABI, CORE_WRITER, CORE_WRITER_ABI, CORE_DEPOSIT_ABI, SPOT_DEX, STATUS } from './abis'
 import { checkFee } from './validate'
 import {
   initRelayStore,
@@ -185,6 +185,12 @@ export function mountRelay(app: Hono): boolean {
   const bridgePollTries = envInt('BRIDGE_CREDIT_POLL_TRIES', 25)
   const spotMaxAttempts = envInt('SPOT_MAX_ATTEMPTS', 3)
   const spotResumeMs = envInt('SPOT_RESUME_MS', 30_000)
+  // USDC (coreToken 0) bridges to Core via Circle's CoreDepositWallet.deposit(),
+  // NOT the 0x2000+idx system-address transfer (that's for HYPE/HIP-1 tokens).
+  // Defaults to the mainnet CoreDepositWallet; override via env.
+  const coreDepositWallet =
+    process.env.CORE_DEPOSIT_WALLET?.toLowerCase() ||
+    (cfg.chainId === 999 ? '0x6b9e773128f453f5c2c60935ee2de2cbc5390a24' : '')
 
   // Independent nonce lock for the bridge wallet's own EVM txs (it's a separate
   // signer from the main relayer, so it needs its own serialized nonce).
@@ -262,19 +268,40 @@ export function mountRelay(app: Hono): boolean {
       // bridge tx that wasn't journaled), skip straight to the credit/spotSend.
       const bal: BigNumber = await token.balanceOf(bridgeAddr!)
       const amt = BigNumber.from(job.evmReceived)
+      // USDC (coreToken 0) bridges via Circle's CoreDepositWallet.deposit(), not a
+      // transfer to the 0x2000+idx system address. Everything else uses the
+      // system-address transfer (HYPE/HIP-1 tokens).
+      const isUsdc = BigNumber.from(job.coreToken).isZero()
       if (bal.gte(amt)) {
-        // Pre-simulate so a permanently-reverting transfer (e.g. the token
-        // blacklists the HyperCore system address) fails WITHOUT sending a tx —
-        // otherwise every retry burns gas on a reverted tx.
-        try {
-          await token.callStatic.transfer(systemAddr(job.coreToken), amt, { from: bridgeAddr! })
-        } catch (e) {
-          throw new Error('bridge transfer would revert: ' + extractRevert(e))
+        if (isUsdc) {
+          if (!coreDepositWallet) throw new Error('CORE_DEPOSIT_WALLET not configured for USDC bridge')
+          const cdw = new ethers.Contract(coreDepositWallet, CORE_DEPOSIT_ABI, bridgeWallet!)
+          // approve the CoreDepositWallet to pull the USDC, then deposit to spot.
+          const approveData = token.interface.encodeFunctionData('approve', [coreDepositWallet, amt])
+          const aTx = await bridgeSendTx(job.token, approveData, gasBridgeTransfer)
+          await aTx.wait(1)
+          try {
+            await cdw.callStatic.deposit(amt, SPOT_DEX, { from: bridgeAddr! })
+          } catch (e) {
+            throw new Error('CoreDepositWallet.deposit would revert: ' + extractRevert(e))
+          }
+          const depositData = cdw.interface.encodeFunctionData('deposit', [amt, SPOT_DEX])
+          const tx = await bridgeSendTx(coreDepositWallet, depositData, gasBridgeTransfer)
+          await tx.wait(1)
+          bridgeTxHash = tx.hash
+        } else {
+          // Pre-simulate so a permanently-reverting transfer fails WITHOUT sending
+          // a tx — otherwise every retry burns gas on a reverted tx.
+          try {
+            await token.callStatic.transfer(systemAddr(job.coreToken), amt, { from: bridgeAddr! })
+          } catch (e) {
+            throw new Error('bridge transfer would revert: ' + extractRevert(e))
+          }
+          const data = token.interface.encodeFunctionData('transfer', [systemAddr(job.coreToken), amt])
+          const tx = await bridgeSendTx(job.token, data, gasBridgeTransfer)
+          await tx.wait(1)
+          bridgeTxHash = tx.hash
         }
-        const data = token.interface.encodeFunctionData('transfer', [systemAddr(job.coreToken), amt])
-        const tx = await bridgeSendTx(job.token, data, gasBridgeTransfer)
-        await tx.wait(1)
-        bridgeTxHash = tx.hash
       }
       await setSpotBridged(job.id, bridgeTxHash ?? 'recovered')
     }

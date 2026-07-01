@@ -52,6 +52,7 @@ export const POOL_ABI = [
 // (the spot bridge) and spotSends them on Core to the destination.
 export const ERC20_PERMIT_ABI = [
   'function permit(address owner,address spender,uint256 value,uint256 deadline,uint8 v,bytes32 r,bytes32 s)',
+  'function approve(address spender,uint256 amount) returns (bool)',
   'function transfer(address to,uint256 amount) returns (bool)',
   'function transferFrom(address from,address to,uint256 amount) returns (bool)',
   'function balanceOf(address owner) view returns (uint256)',
@@ -59,6 +60,14 @@ export const ERC20_PERMIT_ABI = [
   'function nonces(address owner) view returns (uint256)',
   'event Transfer(address indexed from, address indexed to, uint256 value)',
 ]
+
+// Circle's CoreDepositWallet — the USDC HyperEVM->HyperCore bridge. USDC is NOT
+// bridged by transferring to the 0x2000+idx system address (that's HYPE/other
+// HIP-1 tokens); instead you approve native USDC then call deposit(). See
+// https://docs.chainstack.com/docs/hyperliquid-bridging-usdc
+//   destinationDex: 0 = perps, 4294967295 (uint32 max) = spot.
+export const CORE_DEPOSIT_ABI = ['function deposit(uint256 amount, uint32 destinationDex)']
+export const SPOT_DEX = 4294967295
 
 // CoreWriter (HyperCore system contract) — spot-send action (id 6) lets the
 // bridge wallet forward its Core spot balance to an arbitrary destination.
