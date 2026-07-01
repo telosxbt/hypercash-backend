@@ -396,16 +396,38 @@ export function mountRelay(app: Hono): boolean {
           return c.json({ error: 'bad_order', reason: extractRevert(e) }, 400)
         }
       }
+      // Pre-check ONLY the ZK spend (usdcPool.transact is simulatable via eth_call).
+      // We do NOT callStatic the whole trade(): its fund-and-buy leg touches
+      // HyperCore system contracts (CoreDepositWallet.deposit + CoreWriter) that
+      // aren't simulatable via eth_call — a full callStatic gives a false bare
+      // revert (data=0x) even when the real tx would succeed. So validate the ZK
+      // spend here, then send with a fixed gas limit (skips estimateGas) and
+      // surface the real on-chain outcome.
       try {
-        await simulate(trader, 'trade', [proof, extData, params])
+        await pools.usdc.callStatic.transact(proof, extData, { from: relayer })
+      } catch (e) {
+        const reason = extractRevert(e)
+        console.error('[relay] /relay/trade ZK pre-check revert:', reason)
+        return c.json({ error: 'simulation_reverted', reason, stage: 'zk_spend' }, 400)
+      }
+      let tx: ethers.providers.TransactionResponse
+      try {
+        tx = await send(trader, 'trade', [proof, extData, params], cfg.gasTrade)
       } catch (e) {
         const reason = extractRevert(e)
         const diag = await diagnoseTrade(proof, extData, params)
-        console.error('[relay] /relay/trade sim revert:', reason, '| to:', cfg.trader, '|', JSON.stringify(diag))
-        return c.json({ error: 'simulation_reverted', reason, diag }, 400)
+        console.error('[relay] /relay/trade send failed:', reason, '|', JSON.stringify(diag))
+        return c.json({ error: 'trade_send_failed', reason, diag }, 400)
       }
-      const tx = await send(trader, 'trade', [proof, extData, params], cfg.gasTrade)
-      const receipt = await tx.wait(1)
+      let receipt: ethers.providers.TransactionReceipt
+      try {
+        receipt = await tx.wait(1)
+      } catch (e) {
+        // Mined but reverted (atomic — the ZK spend rolled back too, so no funds
+        // moved; only gas spent). This is a REAL contract revert, not a sim artifact.
+        console.error('[relay] /relay/trade reverted on-chain:', tx.hash, extractRevert(e))
+        return c.json({ error: 'trade_reverted_onchain', reason: extractRevert(e), txHash: tx.hash }, 400)
+      }
       let tradeId: string | undefined
       for (const log of receipt.logs ?? []) {
         try {
